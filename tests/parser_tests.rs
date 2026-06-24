@@ -286,22 +286,19 @@ fn reset_parser() {
     let data1 = write_message(|w| w.write_varint_field(1, 42));
     let data2 = write_message(|w| w.write_varint_field(1, 99));
     let mut handler = RecordingHandler::default();
+    let mut parser = Parser::new(&mut handler);
 
-    {
-        let mut parser = Parser::new(&mut handler);
-        let mut input1 = data1.as_slice();
-        parser.receive(&mut input1).unwrap();
-        parser.close().unwrap();
-    }
-    assert_eq!(handler.varints, vec![(1, 42)]);
+    let mut input1 = data1.as_slice();
+    parser.receive(&mut input1).unwrap();
+    parser.close().unwrap();
 
-    handler.varints.clear();
+    parser.reset();
 
-    {
-        let mut parser = Parser::new(&mut handler);
-        let mut input2 = data2.as_slice();
-        parser.receive(&mut input2).unwrap();
-        parser.close().unwrap();
-    }
-    assert_eq!(handler.varints, vec![(1, 99)]);
+    let mut input2 = data2.as_slice();
+    parser.receive(&mut input2).unwrap();
+    parser.close().unwrap();
+
+    // Same parser instance; handler accumulates both messages (gumdrop clears
+    // handler between phases — not possible here while parser borrows handler).
+    assert_eq!(handler.varints, vec![(1, 42), (1, 99)]);
 }
