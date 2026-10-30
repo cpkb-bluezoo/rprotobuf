@@ -1,5 +1,7 @@
 //! Handler trait and default implementation.
 
+use loopbuf::LoopBuf;
+
 /// Callback interface for push-based protobuf parsing.
 ///
 /// The parser invokes these methods as fields are encountered. Schema
@@ -15,7 +17,18 @@ pub trait Handler {
     fn handle_fixed32(&mut self, _field_number: u32, _value: u32) {}
 
     /// Length-delimited field that is not an embedded message (bytes, string, packed).
-    fn handle_bytes(&mut self, _field_number: u32, _data: &[u8]) {}
+    ///
+    /// `data` is a window onto the parser's own ring, holding exactly the
+    /// field's payload: no copy was made. Read it with
+    /// [`LoopBuf::readable_spans`] (the second span is empty unless the
+    /// payload straddles the ring's wrap), or hand it straight to another
+    /// parser's `receive` when the field holds an encoded message or other
+    /// data in a format that has one. Whatever the handler advances past is
+    /// not carried over, and nothing can be written to it.
+    ///
+    /// It is only valid for the duration of the call, so a handler that needs
+    /// the content afterwards must copy it (see [`decode_helpers::as_bytes`]).
+    fn handle_bytes(&mut self, _field_number: u32, _data: &mut LoopBuf) {}
 
     /// Return true if a length-delimited field is an embedded message.
     fn is_message(&self, _field_number: u32) -> bool {
@@ -36,6 +49,8 @@ impl Handler for DefaultHandler {}
 
 /// Value interpretation helpers (mirror gumdrop `DefaultProtobufHandler`).
 pub mod decode_helpers {
+    use loopbuf::LoopBuf;
+
     pub fn as_bool(value: u64) -> bool {
         value != 0
     }
@@ -57,11 +72,17 @@ pub mod decode_helpers {
         f32::from_bits(value)
     }
 
-    pub fn as_string(data: &[u8]) -> Result<String, std::string::FromUtf8Error> {
-        String::from_utf8(data.to_vec())
+    /// The payload of a bytes field as a `String`, copying it out of the ring.
+    pub fn as_string(data: &LoopBuf) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(as_bytes(data))
     }
 
-    pub fn as_bytes(data: &[u8]) -> Vec<u8> {
-        data.to_vec()
+    /// The payload of a bytes field as a `Vec`, copying it out of the ring.
+    pub fn as_bytes(data: &LoopBuf) -> Vec<u8> {
+        let (a, b) = data.readable_spans();
+        let mut bytes = Vec::with_capacity(a.len() + b.len());
+        bytes.extend_from_slice(a);
+        bytes.extend_from_slice(b);
+        bytes
     }
 }

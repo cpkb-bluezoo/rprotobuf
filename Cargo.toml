@@ -1,6 +1,6 @@
 [package]
 name = "rprotobuf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.70"
 description = "Push-based Protocol Buffers parser and writer (gumdrop/jsonparser-style)"
@@ -13,5 +13,9 @@ categories = ["encoding", "parser-implementations"]
 [lib]
 name = "rprotobuf"
 path = "src/lib.rs"
+
+[dependencies]
+# `path` until a loopbuf release includes `LoopBuf::window`
+loopbuf = { version = "0.1", path = "../loopbuf" }
 
 [dev-dependencies]

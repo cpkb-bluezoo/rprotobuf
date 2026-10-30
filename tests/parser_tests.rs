@@ -1,7 +1,15 @@
 //! Integration tests ported from gumdrop `ProtobufParserTest`.
 
-use rprotobuf::decode_helpers::as_string;
+use loopbuf::LoopBuf;
+use rprotobuf::decode_helpers::{as_bytes, as_string};
 use rprotobuf::{Handler, Parser, Writer};
+
+/// A ring holding `bytes`, with room to spare.
+fn ring(bytes: &[u8]) -> LoopBuf {
+    let mut buf = LoopBuf::with_capacity(bytes.len() + 64);
+    buf.extend_from_slice(bytes);
+    buf
+}
 
 fn write_message<F>(write: F) -> Vec<u8>
 where
@@ -43,8 +51,8 @@ impl Handler for RecordingHandler {
         self.fixed32s.push((field_number, value));
     }
 
-    fn handle_bytes(&mut self, field_number: u32, data: &[u8]) {
-        self.bytes.push((field_number, data.to_vec()));
+    fn handle_bytes(&mut self, field_number: u32, data: &mut LoopBuf) {
+        self.bytes.push((field_number, as_bytes(data)));
     }
 }
 
@@ -73,7 +81,7 @@ impl Handler for MessageTrackingHandler {
         self.varints.push((field_number, value));
     }
 
-    fn handle_bytes(&mut self, field_number: u32, data: &[u8]) {
+    fn handle_bytes(&mut self, field_number: u32, data: &mut LoopBuf) {
         self.last_string = as_string(data).ok();
         let _ = field_number;
     }
@@ -84,7 +92,7 @@ fn parse_varint_field() {
     let data = write_message(|w| w.write_varint_field(1, 150));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
-    let mut input = data.as_slice();
+    let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
     parser.close().unwrap();
     assert_eq!(handler.varints, vec![(1, 150)]);
@@ -99,7 +107,7 @@ fn parse_multiple_varint_fields() {
     });
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
-    let mut input = data.as_slice();
+    let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
     parser.close().unwrap();
     assert_eq!(
@@ -116,7 +124,7 @@ fn parse_bool_field() {
     });
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
-    let mut input = data.as_slice();
+    let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
     parser.close().unwrap();
     assert_eq!(handler.varints, vec![(1, 1), (2, 0)]);
@@ -127,7 +135,7 @@ fn parse_fixed64_field() {
     let data = write_message(|w| w.write_fixed64_field(1, 0x0102_0304_0506_0708));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
-    let mut input = data.as_slice();
+    let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
     parser.close().unwrap();
     assert_eq!(handler.fixed64s, vec![(1, 0x0102_0304_0506_0708)]);
@@ -138,7 +146,7 @@ fn parse_fixed32_field() {
     let data = write_message(|w| w.write_fixed32_field(1, 0x0102_0304));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
-    let mut input = data.as_slice();
+    let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
     parser.close().unwrap();
     assert_eq!(handler.fixed32s, vec![(1, 0x0102_0304)]);
@@ -149,11 +157,11 @@ fn parse_string_field() {
     let data = write_message(|w| w.write_string_field(1, "hello"));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
-    let mut input = data.as_slice();
+    let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
     parser.close().unwrap();
     assert_eq!(handler.bytes.len(), 1);
-    assert_eq!(as_string(&handler.bytes[0].1).unwrap(), "hello");
+    assert_eq!(String::from_utf8(handler.bytes[0].1.clone()).unwrap(), "hello");
 }
 
 #[test]
@@ -161,7 +169,7 @@ fn parse_bytes_field() {
     let data = write_message(|w| w.write_bytes_field(1, &[1, 2, 3, 4]));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
-    let mut input = data.as_slice();
+    let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
     parser.close().unwrap();
     assert_eq!(handler.bytes, vec![(1, vec![1, 2, 3, 4])]);
@@ -185,7 +193,7 @@ fn parse_embedded_message() {
         last_string: None,
     };
     let mut parser = Parser::new(&mut handler);
-    let mut input = data.as_slice();
+    let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
     parser.close().unwrap();
     assert_eq!(handler.message_starts, vec![2]);
@@ -209,7 +217,7 @@ fn parse_nested_messages() {
         last_string: None,
     };
     let mut parser = Parser::new(&mut handler);
-    let mut input = data.as_slice();
+    let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
     parser.close().unwrap();
     assert_eq!(handler.message_starts, vec![1, 2]);
@@ -223,7 +231,7 @@ fn underflow_varint() {
     let partial = &data[..2];
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
-    let mut input = partial;
+    let mut input = ring(partial);
     parser.receive(&mut input).unwrap();
     assert!(parser.is_underflow());
     assert!(handler.varints.is_empty());
@@ -238,11 +246,11 @@ fn underflow_recovery() {
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
 
-    let mut chunk1 = &data[..2];
+    let mut chunk1 = ring(&data[..2]);
     parser.receive(&mut chunk1).unwrap();
     assert!(parser.is_underflow());
 
-    let mut chunk2 = data.as_slice();
+    let mut chunk2 = ring(data.as_slice());
     parser.receive(&mut chunk2).unwrap();
     assert!(!parser.is_underflow());
     parser.close().unwrap();
@@ -254,7 +262,7 @@ fn close_with_underflow_errors() {
     let data = write_message(|w| w.write_string_field(1, "hello world"));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
-    let mut input = &data[..3];
+    let mut input = ring(&data[..3]);
     parser.receive(&mut input).unwrap();
     assert!(parser.is_underflow());
     let err = parser.close().unwrap_err();
@@ -266,7 +274,7 @@ fn invalid_field_number() {
     let data = [0x00u8, 0x01];
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
-    let mut input = &data[..];
+    let mut input = ring(&data);
     let err = parser.receive(&mut input).unwrap_err();
     assert!(err.to_string().contains("field number 0"));
 }
@@ -276,7 +284,7 @@ fn unknown_wire_type() {
     let data = [0x0Bu8, 0x00];
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
-    let mut input = &data[..];
+    let mut input = ring(&data);
     let err = parser.receive(&mut input).unwrap_err();
     assert!(err.to_string().contains("wire type"));
 }
@@ -288,13 +296,13 @@ fn reset_parser() {
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
 
-    let mut input1 = data1.as_slice();
+    let mut input1 = ring(data1.as_slice());
     parser.receive(&mut input1).unwrap();
     parser.close().unwrap();
 
     parser.reset();
 
-    let mut input2 = data2.as_slice();
+    let mut input2 = ring(data2.as_slice());
     parser.receive(&mut input2).unwrap();
     parser.close().unwrap();
 

@@ -4,16 +4,18 @@ Push-based Protocol Buffers parser and writer for Rust.
 
 **rprotobuf** ports the [gumdrop](https://github.com/cpkb-bluezoo/gumdrop) `telemetry.protobuf` package to Rust, using the same design as [jsonparser](https://github.com/cpkb-bluezoo/jsonparser):
 
-- Incremental `receive()` parsing — constant memory, no internal buffering of incomplete fields
+- Incremental `receive()` parsing out of a caller-owned [`loopbuf`](https://github.com/cpkb-bluezoo/loopbuf) ring — the parser consumes whole fields and holds none of the input itself
 - Handler callbacks instead of generated message types
 - Symmetric `Writer` for encoding
-- Zero dependencies beyond the Rust standard library
+- Only `loopbuf` as a dependency
 
 This is **not** a replacement for `prost` or `protobuf-rs` when you want generated structs. Use rprotobuf when you want event-driven processing: parameterise a state machine from queue records, stream fields without materialising a domain object, or build in-memory objects only where appropriate (e.g. config CDC).
 
 ## Parser
 
 ```rust
+use loopbuf::LoopBuf;
+use rprotobuf::decode_helpers::as_string;
 use rprotobuf::{Handler, Parser, Writer};
 
 struct JobHandler {
@@ -21,9 +23,10 @@ struct JobHandler {
 }
 
 impl Handler for JobHandler {
-    fn handle_bytes(&mut self, field_number: u32, data: &[u8]) {
+    // `data` is a window onto the parser's ring: no copy was made
+    fn handle_bytes(&mut self, field_number: u32, data: &mut LoopBuf) {
         if field_number == 1 {
-            self.job_id = String::from_utf8(data.to_vec()).ok();
+            self.job_id = as_string(data).ok();
         }
     }
 }
@@ -36,24 +39,49 @@ let encoded = {
 
 let mut handler = JobHandler { job_id: None };
 let mut parser = Parser::new(&mut handler);
-let mut input = encoded.as_slice();
-parser.receive(&mut input).unwrap();
+let mut buf = LoopBuf::with_capacity(4096);
+buf.extend_from_slice(&encoded);
+parser.receive(&mut buf).unwrap();
 parser.close().unwrap();
 ```
 
-### Streaming (NIO-style buffer contract)
+### Streaming (caller-owned buffer contract)
+
+`receive` takes the caller-owned `LoopBuf` and nothing else. It consumes whole
+fields and leaves an incomplete one in the ring, starting at its tag. Read more
+in after it and call `receive` again; reclaiming consumed space moves no data.
 
 ```rust
-// Same compact/flip pattern as jsonparser and gumdrop:
 loop {
-    // read more bytes into `buf`...
-    let mut slice = &buf[..filled];
-    parser.receive(&mut slice)?;
-    // `slice` advanced; keep unconsumed suffix for next read
+    let (spare, _) = buf.spare_capacity_mut();
+    let n = reader.read(spare)?;
+    if n == 0 {
+        break;
+    }
+    buf.commit_write(n);
+    parser.receive(&mut buf)?;
 }
+parser.close()?; // fails if the last field was incomplete
 ```
 
-On underflow, `parser.is_underflow()` is true and `close()` fails until more data arrives.
+On underflow `parser.is_underflow()` is true and `close()` fails until the
+rest arrives.
+
+A bytes, string or packed field is delivered only once all of it is in the
+ring, so the ring must be larger than the largest such field; a ring full of
+one unfinished field makes `receive` return an error. `handle_bytes` gets the
+payload as a window `&mut LoopBuf`: read it with `readable_spans()` (the
+second span is empty unless the payload straddles the ring's wrap), or pass it
+straight to another parser's `receive` when the field holds an encoded message.
+
+### Untrusted input
+
+`Parser::new` places no limit on the size a field may declare. For data you do
+not trust, use `Parser::with_limits(handler, max_message_depth,
+max_length_delimited_size)`: a field declaring more than the limit is rejected
+as soon as its length prefix has been read, before any payload is buffered.
+Nesting is limited to 100 by default. Fields that overrun their enclosing
+message, tags wider than 32 bits and over-long varints are always rejected.
 
 ## Writer
 
