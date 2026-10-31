@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 
 use loopbuf::LoopBuf;
@@ -7,7 +8,7 @@ use crate::wire::{WIRETYPE_I32, WIRETYPE_I64, WIRETYPE_LEN, WIRETYPE_VARINT};
 
 /// Protobuf binary encoder that writes straight into a caller-owned [`LoopBuf`].
 ///
-/// The writer keeps no buffer of its own. Every `write_*` method takes the
+/// The writer keeps no copy of the output. Every `write_*` method takes the
 /// caller's ring and is **atomic**: it appends the whole field (tag and value
 /// together) or appends nothing and returns an error.
 ///
@@ -18,6 +19,20 @@ use crate::wire::{WIRETYPE_I32, WIRETYPE_I64, WIRETYPE_LEN, WIRETYPE_VARINT};
 ///   string field is written whole, as the parser reads it whole, so the ring
 ///   must be larger than the largest.
 ///
+/// # Embedded messages
+///
+/// The length of an embedded message goes before its content but is known only
+/// after it, so it is not written into the ring at all. The ring holds the
+/// message's content; the writer remembers each length prefix and where it
+/// goes, and [`Self::drain_to`] writes the prefix to the sink and then the
+/// content from the ring, in order. The prefix is always the shortest varint,
+/// nothing is moved, and a prefix takes no room in the ring.
+///
+/// So a ring that has had embedded messages written to it is drained with
+/// [`Self::drain_to`], not read directly: [`Self::has_pending_prefixes`] says
+/// whether it matters. A ring that has had only scalar and bytes fields
+/// written to it holds exactly the output, and can be read directly.
+///
 /// ```
 /// use loopbuf::LoopBuf;
 /// use rprotobuf::Writer;
@@ -25,11 +40,35 @@ use crate::wire::{WIRETYPE_I32, WIRETYPE_I64, WIRETYPE_LEN, WIRETYPE_VARINT};
 /// let mut ring = LoopBuf::with_capacity(4096);
 /// let mut w = Writer::new();
 /// w.write_varint_field(&mut ring, 1, 150).unwrap();
-/// assert_eq!(ring.spans().to_vec(), [0x08, 0x96, 0x01]);
+/// w.write_message_field(&mut ring, 2, |w, ring| w.write_string_field(ring, 1, "hi")).unwrap();
+///
+/// let mut out = Vec::new();
+/// w.drain_to(&mut ring, &mut out).unwrap();
+/// assert_eq!(out, [0x08, 0x96, 0x01, 0x12, 0x04, 0x0A, 0x02, b'h', b'i']);
 /// ```
 #[derive(Debug, Default)]
 pub struct Writer {
     bytes_written: u64,
+    /// Length prefixes of embedded messages, in the order they go, each with
+    /// where in the stream of ring bytes it is to be put.
+    prefixes: VecDeque<Prefix>,
+    /// How much of the prefix at the front has already gone to a sink.
+    prefix_done: usize,
+    /// The position, in the stream of every byte the writer has put in the
+    /// ring, of the ring's first readable byte.
+    stream_pos: u64,
+    /// The ring's length when the writer last looked, to tell how much the
+    /// caller has consumed since.
+    last_len: usize,
+}
+
+/// A tag and length prefix, and the position in the ring's byte stream it
+/// goes before.
+#[derive(Debug)]
+struct Prefix {
+    at: u64,
+    len: u8,
+    bytes: [u8; 10],
 }
 
 impl Writer {
@@ -42,8 +81,100 @@ impl Writer {
         self.bytes_written
     }
 
+    /// Starts again, forgetting any length prefixes still waiting to be
+    /// drained. The ring should be empty too.
     pub fn reset(&mut self) {
         self.bytes_written = 0;
+        self.prefixes.clear();
+        self.prefix_done = 0;
+        self.stream_pos = 0;
+        self.last_len = 0;
+    }
+
+    /// True if the length prefix of an embedded message is waiting to be put
+    /// before bytes in the ring. The ring is then not the output: drain it with
+    /// [`Self::drain_to`].
+    pub fn has_pending_prefixes(&self) -> bool {
+        !self.prefixes.is_empty()
+    }
+
+    /// Writes what is in the ring to `sink`, with each embedded message's
+    /// length prefix in front of its content, and consumes it from the ring.
+    /// Returns how many bytes went to the sink.
+    ///
+    /// Stops when the ring is empty or the sink will take no more. If the
+    /// sink reports `WouldBlock` after some bytes went, those are counted and
+    /// `Ok` returned; if none did, the error is. Either way nothing is lost:
+    /// call again when the sink is ready.
+    pub fn drain_to<W: io::Write>(&mut self, ring: &mut LoopBuf, sink: &mut W) -> io::Result<usize> {
+        self.sync(ring).map_err(WriteError::into_io_error)?;
+        let mut moved = 0;
+        let outcome = loop {
+            let next_prefix = self.prefixes.front().map(|p| p.at);
+            if next_prefix == Some(self.stream_pos) {
+                let prefix = self.prefixes.front().expect("a prefix at the front");
+                let rest = &prefix.bytes[self.prefix_done..prefix.len as usize];
+                match sink.write(rest) {
+                    Ok(0) => break Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => {
+                        moved += n;
+                        self.prefix_done += n;
+                        if self.prefix_done == prefix.len as usize {
+                            self.prefixes.pop_front();
+                            self.prefix_done = 0;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => break Err(e),
+                }
+                continue;
+            }
+            // Ring bytes, up to the next prefix if there is one.
+            let until_prefix = next_prefix.map_or(usize::MAX, |at| (at - self.stream_pos) as usize);
+            let limit = ring.len().min(until_prefix);
+            if limit == 0 {
+                break Ok(());
+            }
+            let written = {
+                let (first, second) = ring.readable_spans();
+                let chunk = if first.len() >= limit { &first[..limit] } else if first.is_empty() { &second[..limit.min(second.len())] } else { first };
+                sink.write(chunk)
+            };
+            match written {
+                Ok(0) => break Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    ring.advance(n);
+                    self.stream_pos += n as u64;
+                    moved += n;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => break Err(e),
+            }
+        };
+        self.last_len = ring.len();
+        match outcome {
+            Ok(()) => Ok(moved),
+            Err(e) if moved > 0 && e.kind() == io::ErrorKind::WouldBlock => Ok(moved),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Notes what the caller has consumed from the ring since the writer last
+    /// looked, for the positions of the prefixes still waiting. Consuming
+    /// ring bytes that are already final is fine; consuming past a prefix
+    /// without it is the caller reading the ring directly when it should have
+    /// used [`Self::drain_to`].
+    fn sync(&mut self, buf: &LoopBuf) -> WriteResult<()> {
+        if buf.len() < self.last_len {
+            self.stream_pos += (self.last_len - buf.len()) as u64;
+        }
+        self.last_len = buf.len();
+        if self.prefixes.front().is_some_and(|p| p.at < self.stream_pos) {
+            return Err(invalid_input(
+                "the ring was read past an embedded message's length prefix: drain it with Writer::drain_to",
+            ));
+        }
+        Ok(())
     }
 
     pub fn write_tag(&mut self, buf: &mut LoopBuf, field_number: u32, wire_type: u8) -> WriteResult<()> {
@@ -142,22 +273,19 @@ impl Writer {
     }
 
     /// Writes an embedded message field. `content` writes the message's fields
-    /// (with the same writer and ring) straight into the ring, after the tag
-    /// and a reserved length; once it returns, the length is filled in. There
-    /// is no scratch buffer and no copy.
+    /// (with the same writer and ring) straight into the ring.
+    ///
+    /// The tag and length prefix are not written into the ring: the writer
+    /// notes them, and [`Self::drain_to`] puts them in front of the content as
+    /// it drains the ring to a sink (see the type documentation). The prefix is
+    /// the shortest varint, and takes no room in the ring. An empty message is
+    /// a tag and a zero length, written into the ring as it is.
     ///
     /// The whole message is atomic: if `content` fails, for instance because
     /// the ring filled up, everything written since the field began is taken
     /// back and the error returned, so the caller can drain the ring and repeat
-    /// the same call. This means the message must fit the ring as a whole, and
-    /// `content` must only append to it, never consume from it.
-    ///
-    /// The length is the shortest varint, as any other encoder would write it,
-    /// though it is not known until the content has been. One byte is reserved
-    /// for it, which is all a message under 128 bytes needs. A longer one has
-    /// its content moved on within the ring by the extra bytes the length
-    /// takes (a memmove of just that message, once, however deeply it is
-    /// nested), so the ring needs room for those too.
+    /// the same call. This means the message's content must fit the ring as a
+    /// whole, and `content` must only append to it, never consume from it.
     pub fn write_message_field<F>(
         &mut self,
         buf: &mut LoopBuf,
@@ -167,49 +295,57 @@ impl Writer {
     where
         F: FnOnce(&mut Writer, &mut LoopBuf) -> WriteResult<()>,
     {
-        let (tag, tag_len) = tag_bytes(field_number, WIRETYPE_LEN);
-        // The tag and a one byte length, which is widened below if need be.
-        let header_len = tag_len + 1;
-        ensure_room(buf, header_len, "embedded message")?;
-
+        self.sync(buf)?;
         let start = buf.len();
+        let at = self.stream_pos + start as u64;
+        let prefix_mark = self.prefixes.len();
         let written_before = self.bytes_written;
-        buf.extend_from_slice(&tag[..tag_len]);
-        buf.extend_from_slice(&[0x00]);
-        self.bytes_written += header_len as u64;
 
         if let Err(e) = content(self, buf) {
             buf.truncate(start);
+            self.prefixes.truncate(prefix_mark);
             self.bytes_written = written_before;
+            self.last_len = buf.len();
             return Err(e);
         }
 
-        let content_start = start + header_len;
-        let content_len = buf
+        // The message is what the content put in the ring and the prefixes of
+        // the messages inside it, which are kept aside.
+        let in_ring = buf
             .len()
-            .checked_sub(content_start)
+            .checked_sub(start)
             .expect("the content callback must only append to the ring, not consume from it");
+        let inner_prefixes: usize = self.prefixes.range(prefix_mark..).map(|p| p.len as usize).sum();
+        let content_len = in_ring + inner_prefixes;
         if content_len > i32::MAX as usize {
             buf.truncate(start);
+            self.prefixes.truncate(prefix_mark);
             self.bytes_written = written_before;
+            self.last_len = buf.len();
             return Err(invalid_input("embedded message is longer than a length prefix can express"));
         }
+
+        let (tag, tag_len) = tag_bytes(field_number, WIRETYPE_LEN);
         let (length, length_len) = varint_bytes(content_len as u64);
-        if length_len > 1 {
-            // Open a gap for the rest of the length. If the ring has no room
-            // for it the message as a whole does not fit (yet).
-            let extra = length_len - 1;
-            if buf.spare_len() < extra {
-                let total = tag_len + length_len + content_len;
-                buf.truncate(start);
-                self.bytes_written = written_before;
-                return Err(not_enough_room(buf, total, "embedded message"));
+        let prefix_len = tag_len + length_len;
+        if in_ring == 0 {
+            // Nothing for a prefix to go before: it is the whole field.
+            if let Err(e) = ensure_room(buf, prefix_len, "embedded message") {
+                self.last_len = buf.len();
+                return Err(e);
             }
-            buf.extend_from_slice(&[0u8; 4][..extra]);
-            buf.copy_within(content_start..content_start + content_len, content_start + extra);
-            self.bytes_written += extra as u64;
+            buf.extend_from_slice(&tag[..tag_len]);
+            buf.extend_from_slice(&length[..length_len]);
+        } else {
+            let mut bytes = [0u8; 10];
+            bytes[..tag_len].copy_from_slice(&tag[..tag_len]);
+            bytes[tag_len..prefix_len].copy_from_slice(&length[..length_len]);
+            // Before the prefixes of the messages inside this one, which were
+            // added after `prefix_mark` and come later in the stream.
+            self.prefixes.insert(prefix_mark, Prefix { at, len: prefix_len as u8, bytes });
         }
-        buf.overwrite(start + tag_len, &length[..length_len]);
+        self.bytes_written += prefix_len as u64;
+        self.last_len = buf.len();
         Ok(())
     }
 
@@ -220,10 +356,12 @@ impl Writer {
 
     /// Appends `first` then `second` as one atomic write.
     fn put(&mut self, buf: &mut LoopBuf, first: &[u8], second: &[u8], what: &str) -> WriteResult<()> {
+        self.sync(buf)?;
         ensure_room(buf, first.len() + second.len(), what)?;
         buf.extend_from_slice(first);
         buf.extend_from_slice(second);
         self.bytes_written += (first.len() + second.len()) as u64;
+        self.last_len = buf.len();
         Ok(())
     }
 
@@ -241,11 +379,13 @@ impl Writer {
         let (value, value_len) = value;
         let need = tag_len + value_len + payload.len();
         let what = if wire_type == WIRETYPE_LEN { "bytes field" } else { "field" };
+        self.sync(buf)?;
         ensure_room(buf, need, what)?;
         buf.extend_from_slice(&tag[..tag_len]);
         buf.extend_from_slice(&value[..value_len]);
         buf.extend_from_slice(payload);
         self.bytes_written += need as u64;
+        self.last_len = buf.len();
         Ok(())
     }
 }

@@ -6,6 +6,14 @@
 use loopbuf::LoopBuf;
 use rprotobuf::{Writer, WIRETYPE_LEN, WIRETYPE_VARINT};
 
+/// Everything the writer has put in the ring, with embedded messages' length
+/// prefixes merged in, as a sink would receive it.
+fn drained(writer: &mut Writer, ring: &mut LoopBuf) -> Vec<u8> {
+    let mut out = Vec::new();
+    writer.drain_to(ring, &mut out).unwrap();
+    out
+}
+
 #[test]
 fn varint_small_value() {
     let mut writer = Writer::new();
@@ -183,11 +191,17 @@ fn message_field() {
             inner.write_string_field(ring, 1, "test")
         })
         .unwrap();
-    // The length is the shortest varint, as any encoder would write it.
+    // The ring holds only the content; the tag and length are the writer's,
+    // and go in front as the ring is drained. The length is the shortest
+    // varint, as any encoder would write it.
+    assert_eq!(ring.spans().to_vec(), vec![0x0A, 0x04, b't', b'e', b's', b't']);
+    assert!(writer.has_pending_prefixes());
     assert_eq!(
-        ring.spans().to_vec(),
+        drained(&mut writer, &mut ring),
         vec![0x0A, 0x06, 0x0A, 0x04, b't', b'e', b's', b't']
     );
+    assert!(!writer.has_pending_prefixes());
+    assert!(ring.is_empty());
     assert_eq!(writer.bytes_written(), 8);
 }
 
@@ -216,7 +230,7 @@ fn nested_messages_fill_in_every_length() {
         .unwrap();
     // inner: tag 0A, a 2 byte length (200 + 3 = 203 = CB 01), 200 bytes;
     // outer: 08 07 (2), the inner field (1 + 2 + 203 = 206), so 208 = D0 01
-    let bytes = ring.spans().to_vec();
+    let bytes = drained(&mut writer, &mut ring);
     assert_eq!(&bytes[..3], &[0x0A, 0xD0, 0x01]);
     assert_eq!(&bytes[3..8], &[0x08, 0x07, 0x12, 0xCB, 0x01]);
     assert_eq!(bytes.len(), 3 + 208);
@@ -264,72 +278,13 @@ fn message_lengths_are_the_shortest_varint_at_every_boundary() {
                 }
             })
             .unwrap();
-        assert_eq!(ring.spans().to_vec(), reference_message(5, &content), "content of {} bytes", content.len());
+        let out = drained(&mut writer, &mut ring);
+        assert_eq!(out, reference_message(5, &content), "content of {} bytes", content.len());
         if target == 0 || target >= 3 {
             // (the smallest are filled in by hand, past the writer's count)
-            assert_eq!(writer.bytes_written(), ring.len() as u64);
+            assert_eq!(writer.bytes_written(), out.len() as u64);
         }
     }
-}
-
-#[test]
-fn a_message_that_gains_a_length_byte_is_right_wherever_the_ring_wraps() {
-    // 200 bytes of content needs a 2 byte length, so the content is moved on
-    // by one within the ring: at every read position, that move may straddle
-    // the end of the backing array.
-    let content_writer = |inner: &mut Writer, ring: &mut LoopBuf| {
-        inner.write_bytes_field(ring, 1, &(0..197u32).map(|i| i as u8).collect::<Vec<u8>>())
-    };
-    let mut expected_ring = LoopBuf::with_capacity(1024);
-    Writer::new().write_message_field(&mut expected_ring, 9, content_writer).unwrap();
-    let expected = expected_ring.spans().to_vec();
-    for capacity in [expected.len(), expected.len() + 1, 256, 300] {
-        for offset in 0..capacity {
-            let mut ring = LoopBuf::with_capacity(capacity);
-            ring.extend_from_slice(&vec![0; offset]);
-            ring.advance(offset);
-            Writer::new().write_message_field(&mut ring, 9, content_writer).unwrap();
-            assert_eq!(ring.spans().to_vec(), expected, "capacity {capacity} offset {offset}");
-        }
-    }
-}
-
-#[test]
-fn widening_the_length_without_room_waits_or_fails_by_whether_it_could_ever_fit() {
-    // Content of 128 bytes: 1 tag + 1 reserved length + 128 fits a ring of
-    // 130, but the finished message is 1 + 2 + 128 = 131.
-    let write = |ring: &mut LoopBuf| {
-        Writer::new().write_message_field(ring, 1, |inner, ring| {
-            inner.write_bytes_field(ring, 1, &[1u8; 126]) // 1 + 1 + 126 = 128
-        })
-    };
-    let mut ring = LoopBuf::with_capacity(130);
-    let err = write(&mut ring).unwrap_err();
-    assert!(!err.is_would_block(), "can never fit");
-    assert!(ring.is_empty(), "and nothing was left behind");
-
-    // In a bigger ring that is partly full it only has to wait.
-    let mut ring = LoopBuf::with_capacity(200);
-    ring.extend_from_slice(&[0xEE; 70]); // 130 spare: the content fits, the finished message does not
-    let err = write(&mut ring).unwrap_err();
-    assert!(err.is_would_block());
-    assert_eq!(ring.len(), 70);
-    ring.advance(70);
-    write(&mut ring).unwrap();
-    assert_eq!(ring.len(), 131);
-}
-
-#[test]
-fn varint_size() {
-    assert_eq!(Writer::varint_size(0), 1);
-    assert_eq!(Writer::varint_size(1), 1);
-    assert_eq!(Writer::varint_size(127), 1);
-    assert_eq!(Writer::varint_size(128), 2);
-    assert_eq!(Writer::varint_size(150), 2);
-    assert_eq!(Writer::varint_size(16383), 2);
-    assert_eq!(Writer::varint_size(16384), 3);
-    assert_eq!(Writer::varint_size(i32::MAX as u64), 5);
-    assert_eq!(Writer::varint_size(i64::MAX as u64), 9);
 }
 
 #[test]
@@ -406,6 +361,7 @@ fn a_message_that_does_not_fit_is_taken_back_whole() {
     assert!(err.is_would_block(), "{err}");
     assert_eq!(ring.spans().to_vec(), before, "the half-written message is gone");
     assert_eq!(w.bytes_written(), written);
+    assert!(!w.has_pending_prefixes(), "and so are the prefixes of any messages inside it");
 
     // drain, then the same call works
     ring.advance(ring.len());
@@ -419,44 +375,242 @@ fn a_message_that_does_not_fit_is_taken_back_whole() {
 #[test]
 fn a_stream_far_bigger_than_the_ring_comes_out_the_same() {
     fn emit(w: &mut Writer, ring: &mut LoopBuf, out: &mut Vec<u8>) {
-        fn retry(ring: &mut LoopBuf, out: &mut Vec<u8>, mut f: impl FnMut(&mut LoopBuf) -> rprotobuf::WriteResult<()>) {
-            loop {
-                match f(ring) {
-                    Ok(()) => return,
-                    Err(e) if e.is_would_block() => {
-                        ring.read_to_end(out).unwrap();
+        // Drain to the sink and repeat the same call whenever the ring is full.
+        macro_rules! retry {
+            ($call:expr) => {
+                loop {
+                    match $call {
+                        Ok(()) => break,
+                        Err(e) if e.is_would_block() => {
+                            w.drain_to(ring, out).unwrap();
+                        }
+                        Err(e) => panic!("{e}"),
                     }
-                    Err(e) => panic!("{e}"),
                 }
-            }
+            };
         }
         for i in 0..400u64 {
-            retry(ring, out, |r| w.write_varint_field(r, 1, i * 1000));
-            retry(ring, out, |r| w.write_string_field(r, 2, &format!("item {i}")));
-            retry(ring, out, |r| {
-                w.write_message_field(r, 3, |w, r| {
-                    w.write_fixed32_field(r, 1, i as u32)?;
-                    w.write_double_field(r, 2, i as f64)
-                })
-            });
+            retry!(w.write_varint_field(ring, 1, i * 1000));
+            retry!(w.write_string_field(ring, 2, &format!("item {i}")));
+            retry!(w.write_message_field(ring, 3, |w, r| {
+                w.write_fixed32_field(r, 1, i as u32)?;
+                w.write_double_field(r, 2, i as f64)
+            }));
         }
-        ring.read_to_end(out).unwrap();
+        w.drain_to(ring, out).unwrap();
     }
 
     let mut reference = Vec::new();
     emit(&mut Writer::new(), &mut LoopBuf::with_capacity(1 << 20), &mut reference);
-    // the largest unit is the embedded message: 1 + 5 + 5 + 9 = 20 bytes
-    for capacity in [20, 21, 33, 64] {
+    // the largest unit is the embedded message's content: 5 + 9 = 14 bytes
+    for capacity in [14, 15, 33, 64] {
         let mut out = Vec::new();
         emit(&mut Writer::new(), &mut LoopBuf::with_capacity(capacity), &mut out);
         assert_eq!(out, reference, "capacity {capacity}");
     }
 }
 
-// -- the parser reads what the writer wrote, from the same ring ---------------
+// -- length prefixes are merged in as the ring is drained -----------------------
+
+/// A sink that takes at most `max` bytes at a time and will not take any on
+/// every third call.
+struct Trickle {
+    out: Vec<u8>,
+    max: usize,
+    calls: usize,
+}
+
+impl std::io::Write for Trickle {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        if self.calls % 3 == 0 {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        let n = bytes.len().min(self.max);
+        self.out.extend_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The same message as an encoder that knows its size up front would write it.
+fn nested_reference() -> Vec<u8> {
+    fn wrap(field: u8, content: &[u8]) -> Vec<u8> {
+        let mut len = Vec::new();
+        let mut v = content.len();
+        loop {
+            if v < 0x80 {
+                len.push(v as u8);
+                break;
+            }
+            len.push((v & 0x7F) as u8 | 0x80);
+            v >>= 7;
+        }
+        let mut out = vec![field << 3 | 2];
+        out.extend(len);
+        out.extend_from_slice(content);
+        out
+    }
+    let mut innermost = vec![0x08, 0x07];
+    innermost.extend(wrap(1, &[0xAA; 200]));
+    let mut inner = vec![0x08, 0x01];
+    inner.extend(wrap(2, &innermost));
+    inner.extend([0x10, 0x02]);
+    let mut outer = vec![0x08, 0x05];
+    outer.extend(wrap(3, &inner));
+    outer.extend(wrap(4, &[]));
+    outer.extend([0x18, 0x09]);
+    wrap(1, &outer)
+}
+
+fn write_nested(w: &mut Writer, ring: &mut LoopBuf) -> rprotobuf::WriteResult<()> {
+    w.write_message_field(ring, 1, |w, ring| {
+        w.write_varint_field(ring, 1, 5)?;
+        w.write_message_field(ring, 3, |w, ring| {
+            w.write_varint_field(ring, 1, 1)?;
+            w.write_message_field(ring, 2, |w, ring| {
+                w.write_varint_field(ring, 1, 7)?;
+                w.write_bytes_field(ring, 1, &[0xAA; 200])
+            })?;
+            w.write_varint_field(ring, 2, 2)
+        })?;
+        w.write_message_field(ring, 4, |_, _| Ok(()))?;
+        w.write_varint_field(ring, 3, 9)
+    })
+}
 
 #[test]
-fn the_parser_reads_the_ring_the_writer_filled() {
+fn prefixes_are_merged_in_order_whatever_the_nesting() {
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    write_nested(&mut w, &mut ring).unwrap();
+    let out = drained(&mut w, &mut ring);
+    // (the reference's innermost message has the 0x08 0x07 first, then field 1)
+    assert_eq!(out, nested_reference());
+    assert_eq!(w.bytes_written(), out.len() as u64);
+}
+
+#[test]
+fn a_prefix_takes_no_room_in_the_ring() {
+    // The content alone is 6 bytes, so a ring of 6 holds the message whatever
+    // its prefix.
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(6);
+    w.write_message_field(&mut ring, 1, |w, ring| w.write_bytes_field(ring, 1, b"1234")).unwrap();
+    assert!(ring.is_full());
+    assert_eq!(drained(&mut w, &mut ring), [0x0A, 0x06, 0x0A, 0x04, b'1', b'2', b'3', b'4']);
+}
+
+#[test]
+fn a_sink_that_trickles_and_blocks_gets_the_same_bytes() {
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    write_nested(&mut w, &mut ring).unwrap();
+    let mut sink = Trickle { out: Vec::new(), max: 1, calls: 0 };
+    let mut rounds = 0;
+    while w.has_pending_prefixes() || !ring.is_empty() {
+        // Each call moves what the sink will take before it blocks.
+        match w.drain_to(&mut ring, &mut sink) {
+            Ok(moved) => assert!(moved > 0),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => panic!("{e}"),
+        }
+        rounds += 1;
+    }
+    assert!(rounds > 100, "the sink took the message a byte or two at a time");
+    assert_eq!(sink.out, nested_reference());
+}
+
+#[test]
+fn a_sink_that_takes_nothing_loses_nothing() {
+    struct Blocked;
+    impl std::io::Write for Blocked {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(ErrorKind::WouldBlock.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    write_nested(&mut w, &mut ring).unwrap();
+    let len = ring.len();
+    let err = w.drain_to(&mut ring, &mut Blocked).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::WouldBlock);
+    assert_eq!(ring.len(), len);
+    assert_eq!(drained(&mut w, &mut ring), nested_reference());
+}
+
+#[test]
+fn writing_to_another_ring_is_just_a_sink() {
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    write_nested(&mut w, &mut ring).unwrap();
+    let mut wire = LoopBuf::with_capacity(4096);
+    w.drain_to(&mut ring, &mut wire).unwrap();
+    assert_eq!(wire.spans().to_vec(), nested_reference());
+}
+
+#[test]
+fn final_bytes_can_be_read_from_the_ring_directly() {
+    // With no prefix waiting the ring is the output: it can be consumed
+    // without the writer, and a message written afterwards is still right.
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(64);
+    w.write_varint_field(&mut ring, 1, 1).unwrap();
+    w.write_string_field(&mut ring, 2, "abc").unwrap();
+    assert!(!w.has_pending_prefixes());
+    let first = ring.spans().to_vec();
+    ring.advance(ring.len());
+    w.write_message_field(&mut ring, 3, |w, ring| w.write_varint_field(ring, 1, 2)).unwrap();
+    assert_eq!(first, [0x08, 0x01, 0x12, 0x03, b'a', b'b', b'c']);
+    assert_eq!(drained(&mut w, &mut ring), [0x1A, 0x02, 0x08, 0x02]);
+}
+
+#[test]
+fn reading_past_a_pending_prefix_is_caught() {
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(64);
+    w.write_message_field(&mut ring, 1, |w, ring| w.write_varint_field(ring, 1, 2)).unwrap();
+    ring.advance(1); // the content, read without the prefix that goes before it
+    let err = w.write_varint_field(&mut ring, 2, 3).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    assert!(w.drain_to(&mut ring, &mut Vec::new()).is_err());
+}
+
+#[test]
+fn empty_messages_leave_no_prefix_behind() {
+    // A million of them through a ring of 8: each is a tag and a zero in the
+    // ring, so nothing accumulates but the ring itself.
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(8);
+    let mut sunk = 0usize;
+    for _ in 0..1_000_000 {
+        loop {
+            match w.write_message_field(&mut ring, 1, |_, _| Ok(())) {
+                Ok(()) => break,
+                Err(e) if e.is_would_block() => {
+                    let mut out = Vec::new();
+                    w.drain_to(&mut ring, &mut out).unwrap();
+                    sunk += out.len();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(!w.has_pending_prefixes());
+    }
+    sunk += ring.len();
+    assert_eq!(sunk, 2_000_000);
+}
+
+// -- the parser reads what the writer wrote -------------------------------------
+
+#[test]
+fn the_parser_reads_what_the_writer_drained() {
     use rprotobuf::{Handler, Parser};
     #[derive(Default)]
     struct Log(Vec<String>);
@@ -489,12 +643,14 @@ fn the_parser_reads_the_ring_the_writer_filled() {
     .unwrap();
     w.write_string_field(&mut ring, 4, "after").unwrap();
 
-    // no copy between them: the parser consumes the ring the writer filled
+    // the writer drains into the ring the parser reads
+    let mut wire = LoopBuf::with_capacity(512);
+    w.drain_to(&mut ring, &mut wire).unwrap();
     let mut log = Log::default();
     let mut p = Parser::new(&mut log);
-    p.receive(&mut ring).unwrap();
+    p.receive(&mut wire).unwrap();
     p.close().unwrap();
-    assert!(ring.is_empty());
+    assert!(wire.is_empty());
     assert_eq!(
         log.0,
         [

@@ -87,7 +87,7 @@ message, tags wider than 32 bits and over-long varints are always rejected.
 ## Writer
 
 The writer is the mirror of `receive(&mut LoopBuf)`: it encodes straight into a
-caller-owned `LoopBuf` and keeps no buffer of its own.
+caller-owned `LoopBuf` and keeps no copy of the output.
 
 ```rust
 use loopbuf::LoopBuf;
@@ -100,7 +100,9 @@ w.write_string_field(&mut ring, 2, "hello")?;
 w.write_message_field(&mut ring, 3, |inner, ring| {
     inner.write_bool_field(ring, 1, true)
 })?;
-// `ring` now holds the message: drain it to a socket or file, or parse it
+
+// drain to a socket or file (any `io::Write`, another `LoopBuf` included)
+w.drain_to(&mut ring, &mut socket)?;
 ```
 
 Every call is **atomic**: it appends the whole field (tag and value together) or
@@ -110,18 +112,31 @@ never fit and is an `InvalidInput` error; as the parser reads a bytes field
 whole, so the writer writes it whole, and the ring must be larger than the
 largest.
 
-An embedded message is written in place, with no scratch buffer: the tag and a
-reserved length, then the content straight into the ring, then the length is
-filled in. If the content fails (the ring fills up, say) everything written
-since the field began is taken back, so the message as a whole is atomic and the
-call can be repeated. This means the message must fit the ring, and the closure
-must only append to it, never consume from it.
+### Embedded messages and `drain_to`
 
-The length is the shortest varint, as any other encoder writes it. It is not
-known until the content is, so one byte is reserved, which is all a message under
-128 bytes needs; a longer message has its content moved on within the ring by the
-extra bytes the length takes (one `LoopBuf::copy_within` of that message), so the
-ring needs room for those too.
+The length of an embedded message goes before its content but is known only
+after it. So it is not written into the ring: the ring holds the message's
+content, the writer remembers each tag and length prefix and where it goes, and
+`drain_to` writes the prefix to the sink and then the content from the ring, in
+order. The prefix is the shortest varint, as any other encoder writes it, no
+byte is moved, and a prefix takes no room in the ring.
+
+If the content fails (the ring fills up, say) everything written since the
+field began is taken back, prefixes included, so the message as a whole is
+atomic and the call can be repeated. This means a message's content must fit the
+ring, and the closure must only append to it, never consume from it.
+
+Because of this, a ring that has had embedded messages written to it is drained
+with `drain_to`, not read directly (`has_pending_prefixes()` says whether it
+matters). A ring that has had only scalar and bytes fields written to it holds
+exactly the output and can be read directly, and consuming it that way is
+tracked, so a message written afterwards is still right. Reading the ring past a
+waiting prefix is detected and refused.
+
+`drain_to` stops when the ring is empty or the sink will take no more. If the
+sink reports `WouldBlock` after some bytes went, those are counted and `Ok`
+returned; if none did, the error is. Nothing is lost either way: call it again
+when the sink is ready.
 
 ## Relationship to other bluezoo libraries
 

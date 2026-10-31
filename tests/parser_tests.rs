@@ -18,7 +18,10 @@ where
     let mut writer = Writer::new();
     let mut ring = LoopBuf::with_capacity(4096);
     write(&mut writer, &mut ring).unwrap();
-    ring.spans().to_vec()
+    // Embedded messages' length prefixes are merged in as the ring drains.
+    let mut out = Vec::new();
+    writer.drain_to(&mut ring, &mut out).unwrap();
+    out
 }
 
 struct RecordingHandler {

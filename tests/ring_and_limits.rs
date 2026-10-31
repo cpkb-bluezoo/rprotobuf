@@ -239,7 +239,9 @@ fn sample() -> (Vec<u8>, &'static [u32]) {
     })
     .unwrap();
     w.write_varint_field(&mut ring, 7, 1).unwrap();
-    (ring.spans().to_vec(), &[6, 3])
+    let mut out = Vec::new();
+    w.drain_to(&mut ring, &mut out).unwrap();
+    (out, &[6, 3])
 }
 
 #[test]
