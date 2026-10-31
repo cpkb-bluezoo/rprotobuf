@@ -60,6 +60,8 @@ pub struct Writer {
     /// The ring's length when the writer last looked, to tell how much the
     /// caller has consumed since.
     last_len: usize,
+    /// How much of the bytes field being written in pieces is still owed.
+    bytes_owed: Option<u64>,
 }
 
 /// A tag and length prefix, and the position in the ring's byte stream it
@@ -89,6 +91,7 @@ impl Writer {
         self.prefix_done = 0;
         self.stream_pos = 0;
         self.last_len = 0;
+        self.bytes_owed = None;
     }
 
     /// True if the length prefix of an embedded message is waiting to be put
@@ -164,6 +167,16 @@ impl Writer {
     /// ring bytes that are already final is fine; consuming past a prefix
     /// without it is the caller reading the ring directly when it should have
     /// used [`Self::drain_to`].
+    fn begin(&mut self, buf: &LoopBuf) -> WriteResult<()> {
+        self.sync(buf)?;
+        if self.bytes_owed.is_some() {
+            return Err(invalid_input(
+                "a bytes field written in pieces is still open: finish it with write_end_bytes first",
+            ));
+        }
+        Ok(())
+    }
+
     fn sync(&mut self, buf: &LoopBuf) -> WriteResult<()> {
         if buf.len() < self.last_len {
             self.stream_pos += (self.last_len - buf.len()) as u64;
@@ -258,6 +271,76 @@ impl Writer {
         self.write_bytes_field(buf, field_number, value.as_bytes())
     }
 
+    /// Starts a bytes (or string) field of `length` bytes whose payload is
+    /// written in pieces: this call writes the tag and length, then any number
+    /// of [`Self::write_bytes_content`] calls total exactly `length` bytes, then
+    /// [`Self::write_end_bytes`]. Nothing else can be written in between. The
+    /// same as the parser's `start_bytes`, `bytes_content` and `end_bytes`.
+    ///
+    /// Protobuf puts the length first, so it has to be known: the whole payload
+    /// need not be, or fit the ring. For a string, `length` is its UTF-8 length.
+    ///
+    /// Inside [`Self::write_message_field`] the message has to fit the ring as a
+    /// whole, so there a field written in pieces is bounded by the ring too.
+    pub fn write_start_bytes(&mut self, buf: &mut LoopBuf, field_number: u32, length: u64) -> WriteResult<()> {
+        if length > i32::MAX as u64 {
+            return Err(invalid_input("a length-delimited field is longer than a length prefix can express"));
+        }
+        let (tag, tag_len) = tag_bytes(field_number, WIRETYPE_LEN);
+        let (len, len_len) = varint_bytes(length);
+        self.put(buf, &tag[..tag_len], &len[..len_len], "bytes field header")?;
+        self.bytes_owed = Some(length);
+        Ok(())
+    }
+
+    /// Writes part of the payload of the field started by
+    /// [`Self::write_start_bytes`]: as much of `data` as fits the ring,
+    /// returning how many bytes that was, to be repeated for the rest once the
+    /// ring has been drained. Zero only for empty `data`; a ring with no room
+    /// at all is an error of kind `WouldBlock`.
+    ///
+    /// It is an error to write more than the length declared.
+    pub fn write_bytes_content(&mut self, buf: &mut LoopBuf, data: &[u8]) -> WriteResult<usize> {
+        self.sync(buf)?;
+        let Some(owed) = self.bytes_owed else {
+            return Err(invalid_input("no bytes field is open: start one with write_start_bytes"));
+        };
+        if data.len() as u64 > owed {
+            return Err(invalid_input(format!(
+                "{} bytes offered but only {owed} are left of the length declared",
+                data.len()
+            )));
+        }
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let n = data.len().min(buf.spare_len());
+        if n == 0 {
+            return Err(not_enough_room(buf, 1, "bytes content"));
+        }
+        buf.extend_from_slice(&data[..n]);
+        self.bytes_owed = Some(owed - n as u64);
+        self.bytes_written += n as u64;
+        self.last_len = buf.len();
+        Ok(n)
+    }
+
+    /// Ends the field started by [`Self::write_start_bytes`]. It is an error if
+    /// fewer bytes were written than the length declared; the field stays open.
+    pub fn write_end_bytes(&mut self, buf: &mut LoopBuf) -> WriteResult<()> {
+        self.sync(buf)?;
+        match self.bytes_owed {
+            None => Err(invalid_input("no bytes field is open: start one with write_start_bytes")),
+            Some(0) => {
+                self.bytes_owed = None;
+                Ok(())
+            }
+            Some(owed) => Err(invalid_input(format!(
+                "{owed} bytes of the length declared have not been written"
+            ))),
+        }
+    }
+
     /// Writes an already-encoded embedded message with its length prefix.
     /// Writes nothing if it is empty.
     pub fn write_encoded_message_field(
@@ -295,16 +378,23 @@ impl Writer {
     where
         F: FnOnce(&mut Writer, &mut LoopBuf) -> WriteResult<()>,
     {
-        self.sync(buf)?;
+        self.begin(buf)?;
         let start = buf.len();
         let at = self.stream_pos + start as u64;
         let prefix_mark = self.prefixes.len();
         let written_before = self.bytes_written;
 
-        if let Err(e) = content(self, buf) {
+        let outcome = content(self, buf).and_then(|()| match self.bytes_owed {
+            None => Ok(()),
+            Some(_) => Err(invalid_input(
+                "a bytes field inside the message was started but not ended with write_end_bytes",
+            )),
+        });
+        if let Err(e) = outcome {
             buf.truncate(start);
             self.prefixes.truncate(prefix_mark);
             self.bytes_written = written_before;
+            self.bytes_owed = None;
             self.last_len = buf.len();
             return Err(e);
         }
@@ -356,7 +446,7 @@ impl Writer {
 
     /// Appends `first` then `second` as one atomic write.
     fn put(&mut self, buf: &mut LoopBuf, first: &[u8], second: &[u8], what: &str) -> WriteResult<()> {
-        self.sync(buf)?;
+        self.begin(buf)?;
         ensure_room(buf, first.len() + second.len(), what)?;
         buf.extend_from_slice(first);
         buf.extend_from_slice(second);
@@ -379,7 +469,7 @@ impl Writer {
         let (value, value_len) = value;
         let need = tag_len + value_len + payload.len();
         let what = if wire_type == WIRETYPE_LEN { "bytes field" } else { "field" };
-        self.sync(buf)?;
+        self.begin(buf)?;
         ensure_room(buf, need, what)?;
         buf.extend_from_slice(&tag[..tag_len]);
         buf.extend_from_slice(&value[..value_len]);
@@ -390,8 +480,8 @@ impl Writer {
     }
 }
 
-fn invalid_input(message: &str) -> WriteError {
-    WriteError::new(io::Error::new(io::ErrorKind::InvalidInput, message.to_owned()))
+fn invalid_input(message: impl Into<String>) -> WriteError {
+    WriteError::new(io::Error::new(io::ErrorKind::InvalidInput, message.into()))
 }
 
 /// Succeeds if `need` bytes can be appended now. Otherwise nothing has been

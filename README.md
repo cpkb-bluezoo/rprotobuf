@@ -15,19 +15,34 @@ This is **not** a replacement for `prost` or `protobuf-rs` when you want generat
 
 ```rust
 use loopbuf::LoopBuf;
-use rprotobuf::decode_helpers::as_string;
-use rprotobuf::{Handler, Parser, Writer};
+use rprotobuf::decode_helpers::BytesCollector;
+use rprotobuf::{Handler, ParseResult, Parser, Writer};
 
 struct JobHandler {
+    field: u32,
+    collector: BytesCollector,
     job_id: Option<String>,
 }
 
 impl Handler for JobHandler {
+    // A bytes or string field arrives as start, any number of pieces, end.
+    fn start_bytes(&mut self, field_number: u32, length: u64) -> ParseResult<()> {
+        self.field = field_number;
+        self.collector.start(length);
+        Ok(())
+    }
+
     // `data` is a window onto the parser's ring: no copy was made
-    fn handle_bytes(&mut self, field_number: u32, data: &mut LoopBuf) {
-        if field_number == 1 {
-            self.job_id = as_string(data).ok();
+    fn bytes_content(&mut self, data: &mut LoopBuf) -> ParseResult<()> {
+        self.collector.push(data); // copies it out and consumes it
+        Ok(())
+    }
+
+    fn end_bytes(&mut self) -> ParseResult<()> {
+        if self.field == 1 {
+            self.job_id = self.collector.take_string().ok();
         }
+        Ok(())
     }
 }
 
@@ -35,9 +50,9 @@ impl Handler for JobHandler {
 let mut buf = LoopBuf::with_capacity(4096);
 Writer::new().write_string_field(&mut buf, 1, "job-abc").unwrap();
 
-let mut parser = Parser::new(JobHandler { job_id: None });
+let mut parser = Parser::new(JobHandler { field: 0, collector: BytesCollector::default(), job_id: None });
 parser.receive(&mut buf).unwrap();
-parser.close().unwrap();
+parser.close(&mut buf).unwrap();
 let handler = parser.into_handler();
 ```
 
@@ -62,27 +77,44 @@ loop {
     buf.commit_write(n);
     parser.receive(&mut buf)?;
 }
-parser.close()?; // fails if the last field was incomplete
+parser.close(&mut buf)?; // fails if the last field was incomplete
 ```
 
 On underflow `parser.is_underflow()` is true and `close()` fails until the
 rest arrives.
 
-A bytes, string or packed field is delivered only once all of it is in the
-ring, so the ring must be larger than the largest such field; a ring full of
-one unfinished field makes `receive` return an error. `handle_bytes` gets the
-payload as a window `&mut LoopBuf`: read it with `readable_spans()` (the
-second span is empty unless the payload straddles the ring's wrap), or pass it
-straight to another parser's `receive` when the field holds an encoded message.
+### Bytes, strings and packed fields
+
+A length-delimited field that is not an embedded message is **streamed**:
+`start_bytes(field, length)`, any number of `bytes_content(window)` pieces, then
+`end_bytes()`. A payload of any size passes through a ring of any size; the
+ring need only hold one scalar field (about fifteen bytes), since embedded
+messages are parsed as ordinary fields in place. A ring full of one unfinished
+scalar field makes `receive` return an error.
+
+`bytes_content` gets the piece as a window onto the ring, with no copy, even if
+it straddles the wrap: read it with `readable_spans()`, or hand it straight to
+another parser's `receive` when the field holds data in a format that has one.
+**What the handler advances past is consumed; what it leaves is offered again,
+at the front of the next piece.** A handler that copies the piece must consume
+it too; `BytesCollector` does both for one that wants the whole field. The
+default consumes everything. A handler that leaves every byte when the ring
+cannot take more is an error, and what it leaves of the last piece is dropped.
+
+Every handler method returns a `ParseResult`, so a handler can stop the parse.
 
 ### Untrusted input
 
-`Parser::new` places no limit on the size a field may declare. For data you do
-not trust, use `Parser::with_limits(handler, max_message_depth,
-max_length_delimited_size)`: a field declaring more than the limit is rejected
-as soon as its length prefix has been read, before any payload is buffered.
-Nesting is limited to 100 by default. Fields that overrun their enclosing
-message, tags wider than 32 bits and over-long varints are always rejected.
+`ParserLimits` (passed to `Parser::with_limits` or `set_limits`) holds the
+limits, each `None` for no limit: `max_nesting_depth` (default 100) and
+`max_field_length` (default none), which rejects a field declaring more as soon
+as its length prefix has been read, before any payload. A bytes field streams,
+so its size costs the parser nothing; set the limit when the handler
+accumulates what it is given. Fields that overrun their enclosing message, tags
+wider than 32 bits and over-long varints are always rejected.
+
+`parser.parse(reader)` reads a whole message from any `io::Read` through a ring
+of `set_buffer_size` bytes (8 KiB by default).
 
 ## Writer
 
@@ -111,6 +143,19 @@ and repeat the same call. A field larger than the ring's whole capacity can
 never fit and is an `InvalidInput` error; as the parser reads a bytes field
 whole, so the writer writes it whole, and the ring must be larger than the
 largest.
+
+### Bytes and strings of any length
+
+`write_bytes_field` and `write_string_field` write a whole field, which must fit
+the ring. For one that may not, write it in pieces, named for the parser's
+events: `write_start_bytes(field, length)`, any number of
+`write_bytes_content(data)` calls that take what fits and return how many bytes
+that was, then `write_end_bytes()`. Protobuf puts the length first, so it must be
+known up front (for a string, its UTF-8 length) but the payload need not fit
+anything. Writing more than the length declared, or ending short of it, is an
+`InvalidInput` error, and nothing else can be written while the field is open.
+Inside `write_message_field` the message must fit the ring as a whole, so a
+field written in pieces there is bounded by the ring too.
 
 ### Embedded messages and `drain_to`
 

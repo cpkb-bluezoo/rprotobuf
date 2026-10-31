@@ -1,8 +1,8 @@
 //! Integration tests ported from gumdrop `ProtobufParserTest`.
 
 use loopbuf::LoopBuf;
-use rprotobuf::decode_helpers::{as_bytes, as_string};
-use rprotobuf::{Handler, Parser, Writer};
+use rprotobuf::decode_helpers::{as_bytes, BytesCollector};
+use rprotobuf::{Handler, ParseResult, Parser, Writer};
 
 /// A ring holding `bytes`, with room to spare.
 fn ring(bytes: &[u8]) -> LoopBuf {
@@ -43,20 +43,30 @@ impl Default for RecordingHandler {
 }
 
 impl Handler for RecordingHandler {
-    fn handle_varint(&mut self, field_number: u32, value: u64) {
+    fn handle_varint(&mut self, field_number: u32, value: u64) -> ParseResult<()> {
         self.varints.push((field_number, value));
+        Ok(())
     }
 
-    fn handle_fixed64(&mut self, field_number: u32, value: u64) {
+    fn handle_fixed64(&mut self, field_number: u32, value: u64) -> ParseResult<()> {
         self.fixed64s.push((field_number, value));
+        Ok(())
     }
 
-    fn handle_fixed32(&mut self, field_number: u32, value: u32) {
+    fn handle_fixed32(&mut self, field_number: u32, value: u32) -> ParseResult<()> {
         self.fixed32s.push((field_number, value));
+        Ok(())
     }
 
-    fn handle_bytes(&mut self, field_number: u32, data: &mut LoopBuf) {
-        self.bytes.push((field_number, as_bytes(data)));
+    fn start_bytes(&mut self, field_number: u32, _length: u64) -> ParseResult<()> {
+        self.bytes.push((field_number, Vec::new()));
+        Ok(())
+    }
+
+    fn bytes_content(&mut self, data: &mut LoopBuf) -> ParseResult<()> {
+        self.bytes.last_mut().unwrap().1.extend(as_bytes(data));
+        data.advance(data.len());
+        Ok(())
     }
 }
 
@@ -66,6 +76,7 @@ struct MessageTrackingHandler {
     message_ends: u32,
     varints: Vec<(u32, u64)>,
     last_string: Option<String>,
+    collector: BytesCollector,
 }
 
 impl Handler for MessageTrackingHandler {
@@ -73,21 +84,34 @@ impl Handler for MessageTrackingHandler {
         self.message_fields.contains(&field_number)
     }
 
-    fn start_message(&mut self, field_number: u32) {
+    fn start_message(&mut self, field_number: u32) -> ParseResult<()> {
         self.message_starts.push(field_number);
+        Ok(())
     }
 
-    fn end_message(&mut self) {
+    fn end_message(&mut self) -> ParseResult<()> {
         self.message_ends += 1;
+        Ok(())
     }
 
-    fn handle_varint(&mut self, field_number: u32, value: u64) {
+    fn handle_varint(&mut self, field_number: u32, value: u64) -> ParseResult<()> {
         self.varints.push((field_number, value));
+        Ok(())
     }
 
-    fn handle_bytes(&mut self, field_number: u32, data: &mut LoopBuf) {
-        self.last_string = as_string(data).ok();
-        let _ = field_number;
+    fn start_bytes(&mut self, _field_number: u32, _length: u64) -> ParseResult<()> {
+        self.collector.start(0);
+        Ok(())
+    }
+
+    fn bytes_content(&mut self, data: &mut LoopBuf) -> ParseResult<()> {
+        self.collector.push(data);
+        Ok(())
+    }
+
+    fn end_bytes(&mut self) -> ParseResult<()> {
+        self.last_string = self.collector.take_string().ok();
+        Ok(())
     }
 }
 
@@ -98,7 +122,7 @@ fn parse_varint_field() {
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input).unwrap();
     assert_eq!(handler.varints, vec![(1, 150)]);
 }
 
@@ -113,7 +137,7 @@ fn parse_multiple_varint_fields() {
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input).unwrap();
     assert_eq!(
         handler.varints,
         vec![(1, 42), (2, 100), (3, 256)]
@@ -130,7 +154,7 @@ fn parse_bool_field() {
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input).unwrap();
     assert_eq!(handler.varints, vec![(1, 1), (2, 0)]);
 }
 
@@ -141,7 +165,7 @@ fn parse_fixed64_field() {
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input).unwrap();
     assert_eq!(handler.fixed64s, vec![(1, 0x0102_0304_0506_0708)]);
 }
 
@@ -152,7 +176,7 @@ fn parse_fixed32_field() {
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input).unwrap();
     assert_eq!(handler.fixed32s, vec![(1, 0x0102_0304)]);
 }
 
@@ -163,7 +187,7 @@ fn parse_string_field() {
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input).unwrap();
     assert_eq!(handler.bytes.len(), 1);
     assert_eq!(String::from_utf8(handler.bytes[0].1.clone()).unwrap(), "hello");
 }
@@ -175,7 +199,7 @@ fn parse_bytes_field() {
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input).unwrap();
     assert_eq!(handler.bytes, vec![(1, vec![1, 2, 3, 4])]);
 }
 
@@ -195,11 +219,12 @@ fn parse_embedded_message() {
         message_ends: 0,
         varints: Vec::new(),
         last_string: None,
+        collector: BytesCollector::default(),
     };
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input).unwrap();
     assert_eq!(handler.message_starts, vec![2]);
     assert_eq!(handler.message_ends, 1);
     assert_eq!(handler.varints, vec![(1, 42), (2, 100), (3, 99)]);
@@ -219,11 +244,12 @@ fn parse_nested_messages() {
         message_ends: 0,
         varints: Vec::new(),
         last_string: None,
+        collector: BytesCollector::default(),
     };
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input).unwrap();
     assert_eq!(handler.message_starts, vec![1, 2]);
     assert_eq!(handler.message_ends, 2);
     assert_eq!(handler.last_string.as_deref(), Some("deepest"));
@@ -257,7 +283,7 @@ fn underflow_recovery() {
     let mut chunk2 = ring(data.as_slice());
     parser.receive(&mut chunk2).unwrap();
     assert!(!parser.is_underflow());
-    parser.close().unwrap();
+    parser.close(&mut chunk2).unwrap();
     assert_eq!(handler.varints, vec![(1, 16384), (2, 42)]);
 }
 
@@ -269,7 +295,7 @@ fn close_with_underflow_errors() {
     let mut input = ring(&data[..3]);
     parser.receive(&mut input).unwrap();
     assert!(parser.is_underflow());
-    let err = parser.close().unwrap_err();
+    let err = parser.close(&mut input).unwrap_err();
     assert!(err.to_string().contains("incomplete"));
 }
 
@@ -302,13 +328,13 @@ fn reset_parser() {
 
     let mut input1 = ring(data1.as_slice());
     parser.receive(&mut input1).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input1).unwrap();
 
     parser.reset();
 
     let mut input2 = ring(data2.as_slice());
     parser.receive(&mut input2).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input2).unwrap();
 
     // Same parser instance; handler accumulates both messages (gumdrop clears
     // handler between phases — not possible here while parser borrows handler).
@@ -326,7 +352,7 @@ fn a_parser_owns_the_handler_it_is_given_and_hands_it_back() {
     let mut parser = Parser::new(RecordingHandler::default());
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input).unwrap();
     // Readable while the parser is still in use, between calls...
     assert_eq!(parser.handler().varints, vec![(1, 7), (2, 8)]);
     parser.handler_mut().varints.clear();
@@ -343,7 +369,7 @@ fn a_handler_can_still_be_lent_to_the_parser() {
         let mut parser = Parser::new(&mut handler);
         let mut input = ring(data.as_slice());
         parser.receive(&mut input).unwrap();
-        parser.close().unwrap();
+        parser.close(&mut input).unwrap();
     }
     assert_eq!(handler.varints, vec![(3, 9)]);
 }
@@ -354,7 +380,7 @@ fn a_boxed_dyn_handler_drives_the_parser() {
     let mut parser = Parser::new(Box::new(RecordingHandler::default()) as Box<dyn Handler>);
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
-    parser.close().unwrap();
+    parser.close(&mut input).unwrap();
 
     // A handler behind a reference to the trait object works the same.
     let mut recording = RecordingHandler::default();
