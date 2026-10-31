@@ -31,16 +31,12 @@ impl Handler for JobHandler {
     }
 }
 
-let encoded = {
-    let mut w = Writer::buffer(64);
-    w.write_string_field(1, "job-abc").unwrap();
-    w.finish()
-};
+// the writer fills the ring and the parser reads that same ring
+let mut buf = LoopBuf::with_capacity(4096);
+Writer::new().write_string_field(&mut buf, 1, "job-abc").unwrap();
 
 let mut handler = JobHandler { job_id: None };
 let mut parser = Parser::new(&mut handler);
-let mut buf = LoopBuf::with_capacity(4096);
-buf.extend_from_slice(&encoded);
 parser.receive(&mut buf).unwrap();
 parser.close().unwrap();
 ```
@@ -85,17 +81,41 @@ message, tags wider than 32 bits and over-long varints are always rejected.
 
 ## Writer
 
+The writer is the mirror of `receive(&mut LoopBuf)`: it encodes straight into a
+caller-owned `LoopBuf` and keeps no buffer of its own.
+
 ```rust
+use loopbuf::LoopBuf;
 use rprotobuf::Writer;
 
-let mut w = Writer::buffer(128);
-w.write_varint_field(1, 150)?;
-w.write_string_field(2, "hello")?;
-w.write_message_field(3, |inner| {
-    inner.write_bool_field(1, true)
+let mut ring = LoopBuf::with_capacity(4096);
+let mut w = Writer::new();
+w.write_varint_field(&mut ring, 1, 150)?;
+w.write_string_field(&mut ring, 2, "hello")?;
+w.write_message_field(&mut ring, 3, |inner, ring| {
+    inner.write_bool_field(ring, 1, true)
 })?;
-let bytes = w.finish();
+// `ring` now holds the message: drain it to a socket or file, or parse it
 ```
+
+Every call is **atomic**: it appends the whole field (tag and value together) or
+nothing. `err.is_would_block()` means the ring has no room right now: drain it
+and repeat the same call. A field larger than the ring's whole capacity can
+never fit and is an `InvalidInput` error; as the parser reads a bytes field
+whole, so the writer writes it whole, and the ring must be larger than the
+largest.
+
+An embedded message is written in place, with no scratch buffer: the tag and a
+reserved length, then the content straight into the ring, then the length is
+filled in. If the content fails (the ring fills up, say) everything written
+since the field began is taken back, so the message as a whole is atomic and the
+call can be repeated. This means the message must fit the ring, and the closure
+must only append to it, never consume from it.
+
+Because the length is not known until the content is written, it is a varint
+padded to a fixed 5 bytes (an empty message is a plain zero). That is valid on
+the wire and accepted by every conforming parser, but it is not the shortest
+encoding, so the bytes differ from other encoders' output for the same message.
 
 ## Relationship to other bluezoo libraries
 

@@ -10,7 +10,7 @@ use loopbuf::LoopBuf;
 use rprotobuf::decode_helpers::as_bytes;
 use rprotobuf::{Handler, Parser, Writer};
 
-fn ring(bytes: &[u8]) -> LoopBuf {
+fn ring_of(bytes: &[u8]) -> LoopBuf {
     let mut buf = LoopBuf::with_capacity(bytes.len() + 64);
     buf.extend_from_slice(bytes);
     buf
@@ -57,7 +57,7 @@ fn events_with_messages(messages: &[u32]) -> Events {
 fn err_of(data: &[u8], messages: &[u32]) -> String {
     let mut h = events_with_messages(messages);
     let mut p = Parser::new(&mut h);
-    p.receive(&mut ring(data)).unwrap_err().to_string()
+    p.receive(&mut ring_of(data)).unwrap_err().to_string()
 }
 
 // -- untrusted input ---------------------------------------------------------
@@ -116,7 +116,7 @@ fn nesting_deeper_than_the_limit_is_rejected() {
             Some(l) => Parser::with_limits(&mut h, l, rprotobuf::UNLIMITED_LENGTH_DELIMITED),
             None => Parser::new(&mut h),
         };
-        let r = p.receive(&mut ring(&nested(depth)));
+        let r = p.receive(&mut ring_of(&nested(depth)));
         r.map(|_| p.close())
     };
     assert!(parse(100, None).unwrap().is_ok(), "the default allows 100");
@@ -132,13 +132,13 @@ fn an_oversize_field_is_rejected_from_its_length_prefix_alone() {
     let prefix = [0x0A, 0xC0, 0x84, 0x3D];
     let mut h = Events::default();
     let mut p = Parser::with_limits(&mut h, 100, 4096);
-    let err = p.receive(&mut ring(&prefix)).unwrap_err().to_string();
+    let err = p.receive(&mut ring_of(&prefix)).unwrap_err().to_string();
     assert!(err.contains("exceeds limit"), "{err}");
 
     // while the same prefix without a limit is just an incomplete field
     let mut h = Events::default();
     let mut p = Parser::new(&mut h);
-    p.receive(&mut ring(&prefix)).unwrap();
+    p.receive(&mut ring_of(&prefix)).unwrap();
     assert!(p.is_underflow());
 }
 
@@ -166,13 +166,14 @@ fn an_eleven_byte_varint_is_rejected() {
 
 #[test]
 fn a_negative_int64_takes_ten_bytes_and_round_trips() {
-    let mut w = Writer::buffer(16);
-    w.write_varint_field(1, u64::MAX).unwrap();
-    let data = w.finish();
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    w.write_varint_field(&mut ring, 1, u64::MAX).unwrap();
+    let data = ring.spans().to_vec();
     assert_eq!(data.len(), 11);
     let mut h = Events::default();
     let mut p = Parser::new(&mut h);
-    p.receive(&mut ring(&data)).unwrap();
+    p.receive(&mut ring_of(&data)).unwrap();
     p.close().unwrap();
     assert_eq!(h.log, [format!("varint 1={}", u64::MAX)]);
 }
@@ -181,14 +182,15 @@ fn a_negative_int64_takes_ten_bytes_and_round_trips() {
 
 #[test]
 fn an_incomplete_field_stays_in_the_ring_from_its_tag() {
-    let mut w = Writer::buffer(64);
-    w.write_varint_field(1, 7).unwrap();
-    w.write_string_field(2, "hello world").unwrap();
-    let data = w.finish();
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    w.write_varint_field(&mut ring, 1, 7).unwrap();
+    w.write_string_field(&mut ring, 2, "hello world").unwrap();
+    let data = ring.spans().to_vec();
     let first = 2; // the complete varint field
     let mut h = Events::default();
     let mut p = Parser::new(&mut h);
-    let mut buf = ring(&data[..data.len() - 3]);
+    let mut buf = ring_of(&data[..data.len() - 3]);
     p.receive(&mut buf).unwrap();
     assert!(p.is_underflow());
     assert_eq!(buf.len(), data.len() - 3 - first, "only the incomplete field is left");
@@ -202,9 +204,10 @@ fn an_incomplete_field_stays_in_the_ring_from_its_tag() {
 
 #[test]
 fn a_ring_too_small_for_a_field_is_an_error() {
-    let mut w = Writer::buffer(256);
-    w.write_bytes_field(1, &[7u8; 100]).unwrap();
-    let data = w.finish();
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    w.write_bytes_field(&mut ring, 1, &[7u8; 100]).unwrap();
+    let data = ring.spans().to_vec();
     let mut h = Events::default();
     let mut p = Parser::new(&mut h);
     let mut buf = LoopBuf::with_capacity(16);
@@ -222,20 +225,21 @@ fn a_ring_too_small_for_a_field_is_an_error() {
 
 /// A message with every kind of field, multi-byte varints, and nesting.
 fn sample() -> (Vec<u8>, &'static [u32]) {
-    let mut w = Writer::buffer(256);
-    w.write_varint_field(1, 300).unwrap();
-    w.write_varint_field(2, u64::MAX).unwrap();
-    w.write_fixed64_field(3, 0x0102_0304_0506_0708).unwrap();
-    w.write_fixed32_field(4, 0xAABB_CCDD).unwrap();
-    w.write_string_field(5, "hello, world").unwrap();
-    w.write_message_field(6, |m| {
-        m.write_varint_field(1, 1_000_000)?;
-        m.write_bytes_field(2, &[9u8; 20])?;
-        m.write_message_field(3, |mm| mm.write_string_field(1, "deep"))
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    w.write_varint_field(&mut ring, 1, 300).unwrap();
+    w.write_varint_field(&mut ring, 2, u64::MAX).unwrap();
+    w.write_fixed64_field(&mut ring, 3, 0x0102_0304_0506_0708).unwrap();
+    w.write_fixed32_field(&mut ring, 4, 0xAABB_CCDD).unwrap();
+    w.write_string_field(&mut ring, 5, "hello, world").unwrap();
+    w.write_message_field(&mut ring, 6, |m, ring| {
+        m.write_varint_field(ring, 1, 1_000_000)?;
+        m.write_bytes_field(ring, 2, &[9u8; 20])?;
+        m.write_message_field(ring, 3, |mm, ring| mm.write_string_field(ring, 1, "deep"))
     })
     .unwrap();
-    w.write_varint_field(7, 1).unwrap();
-    (w.finish(), &[6, 3])
+    w.write_varint_field(&mut ring, 7, 1).unwrap();
+    (ring.spans().to_vec(), &[6, 3])
 }
 
 #[test]
@@ -244,7 +248,7 @@ fn fields_parse_identically_wherever_the_ring_wraps() {
     let whole = {
         let mut h = events_with_messages(messages);
         let mut p = Parser::new(&mut h);
-        p.receive(&mut ring(&data)).unwrap();
+        p.receive(&mut ring_of(&data)).unwrap();
         p.close().unwrap();
         h.log
     };
@@ -307,14 +311,16 @@ impl Handler for Nested {
 
 #[test]
 fn a_bytes_field_can_be_handed_straight_to_another_parser() {
-    let mut inner = Writer::buffer(64);
-    inner.write_varint_field(1, 12345).unwrap();
-    inner.write_string_field(2, "inner").unwrap();
-    let inner = inner.finish();
-    let mut w = Writer::buffer(64);
-    w.write_bytes_field(1, &inner).unwrap();
-    w.write_varint_field(2, 9).unwrap();
-    let data = w.finish();
+    let mut inner = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    inner.write_varint_field(&mut ring, 1, 12345).unwrap();
+    inner.write_string_field(&mut ring, 2, "inner").unwrap();
+    let inner = ring.spans().to_vec();
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    w.write_bytes_field(&mut ring, 1, &inner).unwrap();
+    w.write_varint_field(&mut ring, 2, 9).unwrap();
+    let data = ring.spans().to_vec();
 
     let mut wrapped = 0;
     // a ring only a little bigger than the field, fed a byte at a time, so
@@ -358,13 +364,14 @@ fn what_a_handler_consumes_from_the_window_does_not_leak() {
             data.advance(data.len()); // swallow all of it
         }
     }
-    let mut w = Writer::buffer(32);
-    w.write_bytes_field(1, b"abcdef").unwrap();
-    w.write_varint_field(2, 5).unwrap();
-    let data = w.finish();
+    let mut w = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    w.write_bytes_field(&mut ring, 1, b"abcdef").unwrap();
+    w.write_varint_field(&mut ring, 2, 5).unwrap();
+    let data = ring.spans().to_vec();
     let mut h = Eater(Vec::new());
     let mut p = Parser::new(&mut h);
-    let mut buf = ring(&data);
+    let mut buf = ring_of(&data);
     p.receive(&mut buf).unwrap();
     p.close().unwrap();
     assert!(buf.is_empty(), "the parser advanced past the whole field itself");
@@ -373,14 +380,12 @@ fn what_a_handler_consumes_from_the_window_does_not_leak() {
 
 #[test]
 fn a_writer_can_encode_straight_into_the_ring_the_parser_reads() {
-    // LoopBuf is an io::Write, so the encoder needs no intermediate Vec
     let mut buf = LoopBuf::with_capacity(256);
-    {
-        let mut w = Writer::new(&mut buf);
-        w.write_varint_field(1, 300).unwrap();
-        w.write_string_field(2, "straight in").unwrap();
-        w.write_fixed32_field(3, 7).unwrap();
-    }
+    let mut w = Writer::new();
+    w.write_varint_field(&mut buf, 1, 300).unwrap();
+    w.write_string_field(&mut buf, 2, "straight in").unwrap();
+    w.write_fixed32_field(&mut buf, 3, 7).unwrap();
+
     let mut h = Events::default();
     let mut p = Parser::new(&mut h);
     p.receive(&mut buf).unwrap();
@@ -389,12 +394,4 @@ fn a_writer_can_encode_straight_into_the_ring_the_parser_reads() {
     assert_eq!(h.log.len(), 3);
     assert_eq!(h.log[0], "varint 1=300");
     assert_eq!(h.log[2], "fixed32 3=7");
-}
-
-#[test]
-fn a_writer_to_a_full_ring_reports_that_it_would_block() {
-    let mut buf = LoopBuf::with_capacity(4);
-    let mut w = Writer::new(&mut buf);
-    let err = w.write_string_field(1, "far too long for four bytes").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("full"), "{err}");
 }

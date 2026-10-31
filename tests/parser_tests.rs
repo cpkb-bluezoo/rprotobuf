@@ -13,11 +13,12 @@ fn ring(bytes: &[u8]) -> LoopBuf {
 
 fn write_message<F>(write: F) -> Vec<u8>
 where
-    F: FnOnce(&mut Writer<rprotobuf::Buffer>) -> Result<(), rprotobuf::WriteError>,
+    F: FnOnce(&mut Writer, &mut LoopBuf) -> Result<(), rprotobuf::WriteError>,
 {
-    let mut writer = Writer::buffer(256);
-    write(&mut writer).unwrap();
-    writer.finish()
+    let mut writer = Writer::new();
+    let mut ring = LoopBuf::with_capacity(4096);
+    write(&mut writer, &mut ring).unwrap();
+    ring.spans().to_vec()
 }
 
 struct RecordingHandler {
@@ -89,7 +90,7 @@ impl Handler for MessageTrackingHandler {
 
 #[test]
 fn parse_varint_field() {
-    let data = write_message(|w| w.write_varint_field(1, 150));
+    let data = write_message(|w, ring| w.write_varint_field(ring, 1, 150));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
@@ -100,10 +101,10 @@ fn parse_varint_field() {
 
 #[test]
 fn parse_multiple_varint_fields() {
-    let data = write_message(|w| {
-        w.write_varint_field(1, 42)?;
-        w.write_varint_field(2, 100)?;
-        w.write_varint_field(3, 256)
+    let data = write_message(|w, ring| {
+        w.write_varint_field(ring, 1, 42)?;
+        w.write_varint_field(ring, 2, 100)?;
+        w.write_varint_field(ring, 3, 256)
     });
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
@@ -118,9 +119,9 @@ fn parse_multiple_varint_fields() {
 
 #[test]
 fn parse_bool_field() {
-    let data = write_message(|w| {
-        w.write_bool_field(1, true)?;
-        w.write_bool_field(2, false)
+    let data = write_message(|w, ring| {
+        w.write_bool_field(ring, 1, true)?;
+        w.write_bool_field(ring, 2, false)
     });
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
@@ -132,7 +133,7 @@ fn parse_bool_field() {
 
 #[test]
 fn parse_fixed64_field() {
-    let data = write_message(|w| w.write_fixed64_field(1, 0x0102_0304_0506_0708));
+    let data = write_message(|w, ring| w.write_fixed64_field(ring, 1, 0x0102_0304_0506_0708));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
@@ -143,7 +144,7 @@ fn parse_fixed64_field() {
 
 #[test]
 fn parse_fixed32_field() {
-    let data = write_message(|w| w.write_fixed32_field(1, 0x0102_0304));
+    let data = write_message(|w, ring| w.write_fixed32_field(ring, 1, 0x0102_0304));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
@@ -154,7 +155,7 @@ fn parse_fixed32_field() {
 
 #[test]
 fn parse_string_field() {
-    let data = write_message(|w| w.write_string_field(1, "hello"));
+    let data = write_message(|w, ring| w.write_string_field(ring, 1, "hello"));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
@@ -166,7 +167,7 @@ fn parse_string_field() {
 
 #[test]
 fn parse_bytes_field() {
-    let data = write_message(|w| w.write_bytes_field(1, &[1, 2, 3, 4]));
+    let data = write_message(|w, ring| w.write_bytes_field(ring, 1, &[1, 2, 3, 4]));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(data.as_slice());
@@ -177,13 +178,13 @@ fn parse_bytes_field() {
 
 #[test]
 fn parse_embedded_message() {
-    let data = write_message(|w| {
-        w.write_varint_field(1, 42)?;
-        w.write_message_field(2, |inner| {
-            inner.write_string_field(1, "nested")?;
-            inner.write_varint_field(2, 100)
+    let data = write_message(|w, ring| {
+        w.write_varint_field(ring, 1, 42)?;
+        w.write_message_field(ring, 2, |inner, ring| {
+            inner.write_string_field(ring, 1, "nested")?;
+            inner.write_varint_field(ring, 2, 100)
         })?;
-        w.write_varint_field(3, 99)
+        w.write_varint_field(ring, 3, 99)
     });
     let mut handler = MessageTrackingHandler {
         message_fields: vec![2],
@@ -204,9 +205,9 @@ fn parse_embedded_message() {
 
 #[test]
 fn parse_nested_messages() {
-    let data = write_message(|w| {
-        w.write_message_field(1, |level1| {
-            level1.write_message_field(2, |level2| level2.write_string_field(3, "deepest"))
+    let data = write_message(|w, ring| {
+        w.write_message_field(ring, 1, |level1, ring| {
+            level1.write_message_field(ring, 2, |level2, ring| level2.write_string_field(ring, 3, "deepest"))
         })
     });
     let mut handler = MessageTrackingHandler {
@@ -227,7 +228,7 @@ fn parse_nested_messages() {
 
 #[test]
 fn underflow_varint() {
-    let data = write_message(|w| w.write_varint_field(1, 16384));
+    let data = write_message(|w, ring| w.write_varint_field(ring, 1, 16384));
     let partial = &data[..2];
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
@@ -239,9 +240,9 @@ fn underflow_varint() {
 
 #[test]
 fn underflow_recovery() {
-    let data = write_message(|w| {
-        w.write_varint_field(1, 16384)?;
-        w.write_varint_field(2, 42)
+    let data = write_message(|w, ring| {
+        w.write_varint_field(ring, 1, 16384)?;
+        w.write_varint_field(ring, 2, 42)
     });
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
@@ -259,7 +260,7 @@ fn underflow_recovery() {
 
 #[test]
 fn close_with_underflow_errors() {
-    let data = write_message(|w| w.write_string_field(1, "hello world"));
+    let data = write_message(|w, ring| w.write_string_field(ring, 1, "hello world"));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
     let mut input = ring(&data[..3]);
@@ -291,8 +292,8 @@ fn unknown_wire_type() {
 
 #[test]
 fn reset_parser() {
-    let data1 = write_message(|w| w.write_varint_field(1, 42));
-    let data2 = write_message(|w| w.write_varint_field(1, 99));
+    let data1 = write_message(|w, ring| w.write_varint_field(ring, 1, 42));
+    let data2 = write_message(|w, ring| w.write_varint_field(ring, 1, 99));
     let mut handler = RecordingHandler::default();
     let mut parser = Parser::new(&mut handler);
 

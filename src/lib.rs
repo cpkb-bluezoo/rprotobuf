@@ -32,15 +32,13 @@
 //! else. It consumes whole fields and leaves an incomplete one in the ring to
 //! be presented again with more data.
 
-mod buffer;
 mod error;
 mod handler;
 mod parser;
 mod wire;
 mod writer;
 
-pub use buffer::Buffer;
-pub use error::{ParseError, WriteError};
+pub use error::{ParseError, ParseResult, WriteError, WriteResult};
 pub use handler::{decode_helpers, DefaultHandler, Handler};
 pub use parser::{Parser, DEFAULT_MAX_MESSAGE_DEPTH, UNLIMITED_LENGTH_DELIMITED};
 pub use wire::{WireType, WIRETYPE_I32, WIRETYPE_I64, WIRETYPE_LEN, WIRETYPE_VARINT};
