@@ -49,7 +49,8 @@ impl Handler for Events {
         Ok(())
     }
     fn end_bytes(&mut self) -> ParseResult<()> {
-        self.log.push(format!("bytes {}={:?}", self.field, self.gathered));
+        self.log
+            .push(format!("bytes {}={:?}", self.field, self.gathered));
         Ok(())
     }
     fn is_message(&self, f: u32) -> bool {
@@ -133,7 +134,10 @@ fn nesting_deeper_than_the_limit_is_rejected() {
         let mut p = match limit {
             Some(l) => Parser::with_limits(
                 &mut h,
-                ParserLimits { max_nesting_depth: Some(l), ..ParserLimits::default() },
+                ParserLimits {
+                    max_nesting_depth: Some(l),
+                    ..ParserLimits::default()
+                },
             ),
             None => Parser::new(&mut h),
         };
@@ -155,7 +159,10 @@ fn an_oversize_field_is_rejected_from_its_length_prefix_alone() {
     let mut h = Events::default();
     let mut p = Parser::with_limits(
         &mut h,
-        ParserLimits { max_field_length: Some(4096), ..ParserLimits::default() },
+        ParserLimits {
+            max_field_length: Some(4096),
+            ..ParserLimits::default()
+        },
     );
     let err = p.receive(&mut ring_of(&prefix)).unwrap_err().to_string();
     assert!(err.contains("exceeds limit"), "{err}");
@@ -164,7 +171,10 @@ fn an_oversize_field_is_rejected_from_its_length_prefix_alone() {
     let mut h = Events::default();
     let mut p = Parser::new(&mut h);
     p.receive(&mut ring_of(&prefix)).unwrap();
-    assert!(p.is_underflow(), "it starts the field and waits for the payload");
+    assert!(
+        p.is_underflow(),
+        "it starts the field and waits for the payload"
+    );
 }
 
 #[test]
@@ -211,7 +221,8 @@ fn an_incomplete_field_stays_in_the_ring_from_its_tag() {
     let mut w = Writer::new();
     let mut ring = LoopBuf::with_capacity(4096);
     w.write_varint_field(&mut ring, 1, 7).unwrap();
-    w.write_fixed64_field(&mut ring, 2, 0x0102_0304_0506_0708).unwrap();
+    w.write_fixed64_field(&mut ring, 2, 0x0102_0304_0506_0708)
+        .unwrap();
     let data = ring.spans().to_vec();
     let first = 2; // the complete varint field
     let mut h = Events::default();
@@ -219,7 +230,11 @@ fn an_incomplete_field_stays_in_the_ring_from_its_tag() {
     let mut buf = ring_of(&data[..data.len() - 3]);
     p.receive(&mut buf).unwrap();
     assert!(p.is_underflow());
-    assert_eq!(buf.len(), data.len() - 3 - first, "only the incomplete field is left");
+    assert_eq!(
+        buf.len(),
+        data.len() - 3 - first,
+        "only the incomplete field is left"
+    );
 
     buf.extend_from_slice(&data[data.len() - 3..]);
     p.receive(&mut buf).unwrap();
@@ -242,7 +257,10 @@ fn a_ring_too_small_for_a_scalar_field_is_an_error() {
     let err = loop {
         let n = buf.extend_from_slice(&data[offset..]);
         offset += n;
-        assert!(n > 0, "the ring is full of one unfinished field and the parser did not say so");
+        assert!(
+            n > 0,
+            "the ring is full of one unfinished field and the parser did not say so"
+        );
         if let Err(e) = p.receive(&mut buf) {
             break e;
         }
@@ -273,7 +291,8 @@ fn sample() -> (Vec<u8>, &'static [u32]) {
     let mut ring = LoopBuf::with_capacity(4096);
     w.write_varint_field(&mut ring, 1, 300).unwrap();
     w.write_varint_field(&mut ring, 2, u64::MAX).unwrap();
-    w.write_fixed64_field(&mut ring, 3, 0x0102_0304_0506_0708).unwrap();
+    w.write_fixed64_field(&mut ring, 3, 0x0102_0304_0506_0708)
+        .unwrap();
     w.write_fixed32_field(&mut ring, 4, 0xAABB_CCDD).unwrap();
     w.write_string_field(&mut ring, 5, "hello, world").unwrap();
     w.write_message_field(&mut ring, 6, |m, ring| {
@@ -317,7 +336,8 @@ fn fields_parse_identically_wherever_the_ring_wraps() {
                     p.receive(&mut buf)
                         .unwrap_or_else(|e| panic!("capacity {capacity} step {step}: {e}"));
                 }
-                p.close(&mut buf).unwrap_or_else(|e| panic!("capacity {capacity} step {step}: {e}"));
+                p.close(&mut buf)
+                    .unwrap_or_else(|e| panic!("capacity {capacity} step {step}: {e}"));
                 assert!(buf.is_empty());
             }
             assert_eq!(h.log, whole, "capacity {capacity} step {step}");
@@ -386,14 +406,20 @@ fn a_bytes_field_can_be_handed_straight_to_another_parser() {
         }
         assert_eq!(
             h.inner.handler().log,
-            ["varint 1=12345".to_string(), "bytes 2=[105, 110, 110, 101, 114]".to_string()],
+            [
+                "varint 1=12345".to_string(),
+                "bytes 2=[105, 110, 110, 101, 114]".to_string()
+            ],
             "capacity {capacity}"
         );
         if h.spans_seen.iter().any(|&(_, b)| b > 0) {
             wrapped += 1;
         }
     }
-    assert!(wrapped > 0, "no capacity exercised a payload straddling the wrap");
+    assert!(
+        wrapped > 0,
+        "no capacity exercised a payload straddling the wrap"
+    );
 }
 
 #[test]
@@ -439,7 +465,13 @@ fn a_bytes_field_much_longer_than_the_ring_streams_through_it() {
     wire.extend(&payload);
     wire.extend([0x10, 0x07]); // and a field after it
 
-    let mut p = Parser::new(Tally { starts: vec![], total: 0, sum: 0, ends: 0, pieces: 0 });
+    let mut p = Parser::new(Tally {
+        starts: vec![],
+        total: 0,
+        sum: 0,
+        ends: 0,
+        pieces: 0,
+    });
     let mut ring = LoopBuf::with_capacity(32);
     for chunk in wire.chunks(20) {
         ring.extend_from_slice(chunk);
@@ -482,7 +514,10 @@ fn a_handler_that_leaves_bytes_gets_them_again_with_the_next_piece() {
     p.close(&mut ring).unwrap();
     let k = p.into_handler();
     assert_eq!(k.seen, [b"abcdefgh".to_vec(), b"efghijkl".to_vec()]);
-    assert!(ring.is_empty(), "what is left of the last piece is dropped with the field");
+    assert!(
+        ring.is_empty(),
+        "what is left of the last piece is dropped with the field"
+    );
 }
 
 #[test]
@@ -515,7 +550,11 @@ fn a_handler_error_stops_the_parse() {
     struct Refuses;
     impl Handler for Refuses {
         fn handle_varint(&mut self, f: u32, _v: u64) -> ParseResult<()> {
-            if f == 2 { Err(rprotobuf::ParseError::new("field 2 is not allowed")) } else { Ok(()) }
+            if f == 2 {
+                Err(rprotobuf::ParseError::new("field 2 is not allowed"))
+            } else {
+                Ok(())
+            }
         }
     }
     let mut p = Parser::new(Refuses);
@@ -549,7 +588,10 @@ fn parse_reads_a_whole_message_from_a_reader() {
     let mut p = Parser::new(Events::default());
     p.set_buffer_size(4); // a ring smaller than the message
     p.parse(&wire[..]).unwrap();
-    assert_eq!(p.handler().log, ["varint 1=150", "bytes 2=[116, 101, 115, 116]"]);
+    assert_eq!(
+        p.handler().log,
+        ["varint 1=150", "bytes 2=[116, 101, 115, 116]"]
+    );
 
     // a truncated one is an error
     let mut p = Parser::new(Events::default());

@@ -89,7 +89,9 @@ fn svarint_zigzag() {
 fn fixed64_little_endian() {
     let mut writer = Writer::new();
     let mut ring = LoopBuf::with_capacity(4096);
-    writer.write_fixed64(&mut ring, 0x0102_0304_0506_0708).unwrap();
+    writer
+        .write_fixed64(&mut ring, 0x0102_0304_0506_0708)
+        .unwrap();
     assert_eq!(
         ring.spans().to_vec(),
         vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
@@ -194,7 +196,10 @@ fn message_field() {
     // The ring holds only the content; the tag and length are the writer's,
     // and go in front as the ring is drained. The length is the shortest
     // varint, as any encoder would write it.
-    assert_eq!(ring.spans().to_vec(), vec![0x0A, 0x04, b't', b'e', b's', b't']);
+    assert_eq!(
+        ring.spans().to_vec(),
+        vec![0x0A, 0x04, b't', b'e', b's', b't']
+    );
     assert!(writer.has_pending_prefixes());
     assert_eq!(
         drained(&mut writer, &mut ring),
@@ -223,9 +228,7 @@ fn nested_messages_fill_in_every_length() {
     writer
         .write_message_field(&mut ring, 1, |w, ring| {
             w.write_varint_field(ring, 1, 7)?;
-            w.write_message_field(ring, 2, |w, ring| {
-                w.write_bytes_field(ring, 1, &[9u8; 200])
-            })
+            w.write_message_field(ring, 2, |w, ring| w.write_bytes_field(ring, 1, &[9u8; 200]))
         })
         .unwrap();
     // inner: tag 0A, a 2 byte length (200 + 3 = 203 = CB 01), 200 bytes;
@@ -241,7 +244,9 @@ fn nested_messages_fill_in_every_length() {
 fn reference_message(field: u32, content: &[u8]) -> Vec<u8> {
     let mut writer = Writer::new();
     let mut ring = LoopBuf::with_capacity(content.len() + 32);
-    writer.write_encoded_message_field(&mut ring, field, content).unwrap();
+    writer
+        .write_encoded_message_field(&mut ring, field, content)
+        .unwrap();
     if content.is_empty() {
         // write_encoded_message_field skips an empty message; a message
         // field of nothing is a plain zero length.
@@ -253,12 +258,15 @@ fn reference_message(field: u32, content: &[u8]) -> Vec<u8> {
 #[test]
 fn message_lengths_are_the_shortest_varint_at_every_boundary() {
     // Content sizes either side of where the length gains a byte.
-    for target in [0usize, 1, 2, 126, 127, 128, 129, 130, 16382, 16383, 16384, 16385, 40000] {
+    for target in [
+        0usize, 1, 2, 126, 127, 128, 129, 130, 16382, 16383, 16384, 16385, 40000,
+    ] {
         let payload = target.saturating_sub(3);
         let mut content_ring = LoopBuf::with_capacity(target + 16);
         let mut w = Writer::new();
         if target >= 3 {
-            w.write_bytes_field(&mut content_ring, 1, &vec![0xAB; payload]).unwrap();
+            w.write_bytes_field(&mut content_ring, 1, &vec![0xAB; payload])
+                .unwrap();
         } else if target > 0 {
             for _ in 0..target {
                 content_ring.extend_from_slice(&[0x00]);
@@ -279,7 +287,12 @@ fn message_lengths_are_the_shortest_varint_at_every_boundary() {
             })
             .unwrap();
         let out = drained(&mut writer, &mut ring);
-        assert_eq!(out, reference_message(5, &content), "content of {} bytes", content.len());
+        assert_eq!(
+            out,
+            reference_message(5, &content),
+            "content of {} bytes",
+            content.len()
+        );
         if target == 0 || target >= 3 {
             // (the smallest are filled in by hand, past the writer's count)
             assert_eq!(writer.bytes_written(), out.len() as u64);
@@ -318,9 +331,15 @@ fn a_field_goes_in_whole_or_not_at_all() {
     let mut w = Writer::new();
     w.write_varint_field(&mut ring, 1, 1).unwrap(); // 2 of 8
     let before = ring.spans().to_vec();
-    let err = w.write_string_field(&mut ring, 2, "twelve bytes").unwrap_err();
+    let err = w
+        .write_string_field(&mut ring, 2, "twelve bytes")
+        .unwrap_err();
     assert!(err.is_would_block() || err.kind() == ErrorKind::InvalidInput);
-    assert_eq!(ring.spans().to_vec(), before, "no tag or length left behind");
+    assert_eq!(
+        ring.spans().to_vec(),
+        before,
+        "no tag or length left behind"
+    );
 
     let err = w.write_string_field(&mut ring, 2, "abcde").unwrap_err(); // 7 needed, 6 spare
     assert!(err.is_would_block(), "{err}");
@@ -329,7 +348,10 @@ fn a_field_goes_in_whole_or_not_at_all() {
 
     ring.advance(2);
     w.write_string_field(&mut ring, 2, "abcde").unwrap();
-    assert_eq!(ring.spans().to_vec(), [0x12, 5, b'a', b'b', b'c', b'd', b'e']);
+    assert_eq!(
+        ring.spans().to_vec(),
+        [0x12, 5, b'a', b'b', b'c', b'd', b'e']
+    );
 }
 
 #[test]
@@ -359,9 +381,16 @@ fn a_message_that_does_not_fit_is_taken_back_whole() {
         })
         .unwrap_err();
     assert!(err.is_would_block(), "{err}");
-    assert_eq!(ring.spans().to_vec(), before, "the half-written message is gone");
+    assert_eq!(
+        ring.spans().to_vec(),
+        before,
+        "the half-written message is gone"
+    );
     assert_eq!(w.bytes_written(), written);
-    assert!(!w.has_pending_prefixes(), "and so are the prefixes of any messages inside it");
+    assert!(
+        !w.has_pending_prefixes(),
+        "and so are the prefixes of any messages inside it"
+    );
 
     // drain, then the same call works
     ring.advance(ring.len());
@@ -401,11 +430,19 @@ fn a_stream_far_bigger_than_the_ring_comes_out_the_same() {
     }
 
     let mut reference = Vec::new();
-    emit(&mut Writer::new(), &mut LoopBuf::with_capacity(1 << 20), &mut reference);
+    emit(
+        &mut Writer::new(),
+        &mut LoopBuf::with_capacity(1 << 20),
+        &mut reference,
+    );
     // the largest unit is the embedded message's content: 5 + 9 = 14 bytes
     for capacity in [14, 15, 33, 64] {
         let mut out = Vec::new();
-        emit(&mut Writer::new(), &mut LoopBuf::with_capacity(capacity), &mut out);
+        emit(
+            &mut Writer::new(),
+            &mut LoopBuf::with_capacity(capacity),
+            &mut out,
+        );
         assert_eq!(out, reference, "capacity {capacity}");
     }
 }
@@ -499,9 +536,15 @@ fn a_prefix_takes_no_room_in_the_ring() {
     // its prefix.
     let mut w = Writer::new();
     let mut ring = LoopBuf::with_capacity(6);
-    w.write_message_field(&mut ring, 1, |w, ring| w.write_bytes_field(ring, 1, b"1234")).unwrap();
+    w.write_message_field(&mut ring, 1, |w, ring| {
+        w.write_bytes_field(ring, 1, b"1234")
+    })
+    .unwrap();
     assert!(ring.is_full());
-    assert_eq!(drained(&mut w, &mut ring), [0x0A, 0x06, 0x0A, 0x04, b'1', b'2', b'3', b'4']);
+    assert_eq!(
+        drained(&mut w, &mut ring),
+        [0x0A, 0x06, 0x0A, 0x04, b'1', b'2', b'3', b'4']
+    );
 }
 
 #[test]
@@ -509,7 +552,11 @@ fn a_sink_that_trickles_and_blocks_gets_the_same_bytes() {
     let mut w = Writer::new();
     let mut ring = LoopBuf::with_capacity(4096);
     write_nested(&mut w, &mut ring).unwrap();
-    let mut sink = Trickle { out: Vec::new(), max: 1, calls: 0 };
+    let mut sink = Trickle {
+        out: Vec::new(),
+        max: 1,
+        calls: 0,
+    };
     let mut rounds = 0;
     while w.has_pending_prefixes() || !ring.is_empty() {
         // Each call moves what the sink will take before it blocks.
@@ -520,7 +567,10 @@ fn a_sink_that_trickles_and_blocks_gets_the_same_bytes() {
         }
         rounds += 1;
     }
-    assert!(rounds > 100, "the sink took the message a byte or two at a time");
+    assert!(
+        rounds > 100,
+        "the sink took the message a byte or two at a time"
+    );
     assert_eq!(sink.out, nested_reference());
 }
 
@@ -566,7 +616,8 @@ fn final_bytes_can_be_read_from_the_ring_directly() {
     assert!(!w.has_pending_prefixes());
     let first = ring.spans().to_vec();
     ring.advance(ring.len());
-    w.write_message_field(&mut ring, 3, |w, ring| w.write_varint_field(ring, 1, 2)).unwrap();
+    w.write_message_field(&mut ring, 3, |w, ring| w.write_varint_field(ring, 1, 2))
+        .unwrap();
     assert_eq!(first, [0x08, 0x01, 0x12, 0x03, b'a', b'b', b'c']);
     assert_eq!(drained(&mut w, &mut ring), [0x1A, 0x02, 0x08, 0x02]);
 }
@@ -575,7 +626,8 @@ fn final_bytes_can_be_read_from_the_ring_directly() {
 fn reading_past_a_pending_prefix_is_caught() {
     let mut w = Writer::new();
     let mut ring = LoopBuf::with_capacity(64);
-    w.write_message_field(&mut ring, 1, |w, ring| w.write_varint_field(ring, 1, 2)).unwrap();
+    w.write_message_field(&mut ring, 1, |w, ring| w.write_varint_field(ring, 1, 2))
+        .unwrap();
     ring.advance(1); // the content, read without the prefix that goes before it
     let err = w.write_varint_field(&mut ring, 2, 3).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -629,7 +681,8 @@ fn the_parser_reads_what_the_writer_drained() {
             Ok(())
         }
         fn end_bytes(&mut self) -> ParseResult<()> {
-            self.0.push(format!("bytes {}", String::from_utf8_lossy(&self.1)));
+            self.0
+                .push(format!("bytes {}", String::from_utf8_lossy(&self.1)));
             Ok(())
         }
         fn is_message(&self, f: u32) -> bool {
@@ -685,7 +738,14 @@ fn the_parser_reads_what_the_writer_drained() {
 
 /// Writes a bytes field in pieces, draining and repeating whenever the ring
 /// is full.
-fn stream_bytes(w: &mut Writer, ring: &mut LoopBuf, out: &mut Vec<u8>, field: u32, data: &[u8], piece: usize) {
+fn stream_bytes(
+    w: &mut Writer,
+    ring: &mut LoopBuf,
+    out: &mut Vec<u8>,
+    field: u32,
+    data: &[u8],
+    piece: usize,
+) {
     macro_rules! retry {
         ($call:expr) => {
             loop {
@@ -725,7 +785,10 @@ fn bytes_in_pieces_are_the_same_as_the_whole_field() {
             let mut out = Vec::new();
             stream_bytes(&mut w, &mut ring, &mut out, 5, &data, piece);
             w.drain_to(&mut ring, &mut out).unwrap();
-            assert_eq!(out, whole, "{len} bytes, ring {capacity}, pieces of {piece}");
+            assert_eq!(
+                out, whole,
+                "{len} bytes, ring {capacity}, pieces of {piece}"
+            );
             assert_eq!(w.bytes_written(), whole.len() as u64);
         }
     }
@@ -778,7 +841,10 @@ fn a_megabyte_streams_from_the_writer_through_a_small_ring_into_the_parser() {
                                 parser.receive(&mut pring).unwrap();
                                 continue;
                             }
-                            let mut limited = Limited { ring: &mut pring, room };
+                            let mut limited = Limited {
+                                ring: &mut pring,
+                                room,
+                            };
                             let n = w.drain_to(&mut wring, &mut limited).unwrap();
                             parser.receive(&mut pring).unwrap();
                             if n == 0 {
@@ -821,7 +887,10 @@ fn a_megabyte_streams_from_the_writer_through_a_small_ring_into_the_parser() {
     // flush the rest through
     while w.has_pending_prefixes() || !wring.is_empty() || !pring.is_empty() {
         let room = pring.spare_len();
-        let mut limited = Limited { ring: &mut pring, room };
+        let mut limited = Limited {
+            ring: &mut pring,
+            room,
+        };
         let _ = w.drain_to(&mut wring, &mut limited);
         parser.receive(&mut pring).unwrap();
     }
@@ -839,21 +908,43 @@ fn a_bytes_field_in_pieces_refuses_what_does_not_fit_the_declared_length() {
     let mut ring = LoopBuf::with_capacity(64);
     w.write_start_bytes(&mut ring, 1, 4).unwrap();
     // nothing else can be written while it is open
-    assert_eq!(w.write_varint_field(&mut ring, 2, 1).unwrap_err().kind(), ErrorKind::InvalidInput);
-    assert_eq!(w.write_message_field(&mut ring, 2, |_, _| Ok(())).unwrap_err().kind(), ErrorKind::InvalidInput);
-    assert_eq!(w.write_start_bytes(&mut ring, 2, 1).unwrap_err().kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        w.write_varint_field(&mut ring, 2, 1).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        w.write_message_field(&mut ring, 2, |_, _| Ok(()))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        w.write_start_bytes(&mut ring, 2, 1).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
     // too much
-    assert_eq!(w.write_bytes_content(&mut ring, b"12345").unwrap_err().kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        w.write_bytes_content(&mut ring, b"12345")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
     assert_eq!(w.write_bytes_content(&mut ring, b"123").unwrap(), 3);
     // too little
-    assert_eq!(w.write_end_bytes(&mut ring).unwrap_err().kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        w.write_end_bytes(&mut ring).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
     assert_eq!(w.write_bytes_content(&mut ring, b"4").unwrap(), 1);
     w.write_end_bytes(&mut ring).unwrap();
     // and it is over: nothing to add to or end
     assert!(w.write_bytes_content(&mut ring, b"x").is_err());
     assert!(w.write_end_bytes(&mut ring).is_err());
     w.write_varint_field(&mut ring, 2, 1).unwrap();
-    assert_eq!(ring.spans().to_vec(), [0x0A, 4, b'1', b'2', b'3', b'4', 0x10, 0x01]);
+    assert_eq!(
+        ring.spans().to_vec(),
+        [0x0A, 4, b'1', b'2', b'3', b'4', 0x10, 0x01]
+    );
 }
 
 #[test]
@@ -866,7 +957,10 @@ fn a_bytes_field_in_pieces_works_inside_a_message_and_is_taken_back_with_it() {
         w.write_end_bytes(ring)
     })
     .unwrap();
-    assert_eq!(drained(&mut w, &mut ring), [0x0A, 5, 0x0A, 3, b'a', b'b', b'c']);
+    assert_eq!(
+        drained(&mut w, &mut ring),
+        [0x0A, 5, 0x0A, 3, b'a', b'b', b'c']
+    );
 
     // one left open when the message ends is an error, and leaves nothing behind
     let err = w
@@ -884,5 +978,8 @@ fn a_ring_with_no_room_for_a_piece_would_block() {
     let mut ring = LoopBuf::with_capacity(3);
     w.write_start_bytes(&mut ring, 1, 10).unwrap(); // 2 of 3
     assert_eq!(w.write_bytes_content(&mut ring, b"abcdef").unwrap(), 1);
-    assert!(w.write_bytes_content(&mut ring, b"bcdef").unwrap_err().is_would_block());
+    assert!(w
+        .write_bytes_content(&mut ring, b"bcdef")
+        .unwrap_err()
+        .is_would_block());
 }

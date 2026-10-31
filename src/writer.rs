@@ -109,7 +109,11 @@ impl Writer {
     /// sink reports `WouldBlock` after some bytes went, those are counted and
     /// `Ok` returned; if none did, the error is. Either way nothing is lost:
     /// call again when the sink is ready.
-    pub fn drain_to<W: io::Write>(&mut self, ring: &mut LoopBuf, sink: &mut W) -> io::Result<usize> {
+    pub fn drain_to<W: io::Write>(
+        &mut self,
+        ring: &mut LoopBuf,
+        sink: &mut W,
+    ) -> io::Result<usize> {
         self.sync(ring).map_err(WriteError::into_io_error)?;
         let mut moved = 0;
         let outcome = loop {
@@ -140,7 +144,13 @@ impl Writer {
             }
             let written = {
                 let (first, second) = ring.readable_spans();
-                let chunk = if first.len() >= limit { &first[..limit] } else if first.is_empty() { &second[..limit.min(second.len())] } else { first };
+                let chunk = if first.len() >= limit {
+                    &first[..limit]
+                } else if first.is_empty() {
+                    &second[..limit.min(second.len())]
+                } else {
+                    first
+                };
                 sink.write(chunk)
             };
             match written {
@@ -182,7 +192,11 @@ impl Writer {
             self.stream_pos += (self.last_len - buf.len()) as u64;
         }
         self.last_len = buf.len();
-        if self.prefixes.front().is_some_and(|p| p.at < self.stream_pos) {
+        if self
+            .prefixes
+            .front()
+            .is_some_and(|p| p.at < self.stream_pos)
+        {
             return Err(invalid_input(
                 "the ring was read past an embedded message's length prefix: drain it with Writer::drain_to",
             ));
@@ -190,7 +204,12 @@ impl Writer {
         Ok(())
     }
 
-    pub fn write_tag(&mut self, buf: &mut LoopBuf, field_number: u32, wire_type: u8) -> WriteResult<()> {
+    pub fn write_tag(
+        &mut self,
+        buf: &mut LoopBuf,
+        field_number: u32,
+        wire_type: u8,
+    ) -> WriteResult<()> {
         let (scratch, len) = tag_bytes(field_number, wire_type);
         self.put(buf, &scratch[..len], &[], "tag")
     }
@@ -224,40 +243,80 @@ impl Writer {
         self.write_fixed32(buf, value.to_bits())
     }
 
-    pub fn write_varint_field(&mut self, buf: &mut LoopBuf, field_number: u32, value: u64) -> WriteResult<()> {
+    pub fn write_varint_field(
+        &mut self,
+        buf: &mut LoopBuf,
+        field_number: u32,
+        value: u64,
+    ) -> WriteResult<()> {
         self.put_field(buf, field_number, WIRETYPE_VARINT, varint_bytes(value), &[])
     }
 
-    pub fn write_svarint_field(&mut self, buf: &mut LoopBuf, field_number: u32, value: i64) -> WriteResult<()> {
+    pub fn write_svarint_field(
+        &mut self,
+        buf: &mut LoopBuf,
+        field_number: u32,
+        value: i64,
+    ) -> WriteResult<()> {
         self.write_varint_field(buf, field_number, zigzag64(value))
     }
 
-    pub fn write_bool_field(&mut self, buf: &mut LoopBuf, field_number: u32, value: bool) -> WriteResult<()> {
+    pub fn write_bool_field(
+        &mut self,
+        buf: &mut LoopBuf,
+        field_number: u32,
+        value: bool,
+    ) -> WriteResult<()> {
         self.write_varint_field(buf, field_number, u64::from(value))
     }
 
-    pub fn write_fixed64_field(&mut self, buf: &mut LoopBuf, field_number: u32, value: u64) -> WriteResult<()> {
+    pub fn write_fixed64_field(
+        &mut self,
+        buf: &mut LoopBuf,
+        field_number: u32,
+        value: u64,
+    ) -> WriteResult<()> {
         let mut scratch = [0u8; 10];
         scratch[..8].copy_from_slice(&value.to_le_bytes());
         self.put_field(buf, field_number, WIRETYPE_I64, (scratch, 8), &[])
     }
 
-    pub fn write_fixed32_field(&mut self, buf: &mut LoopBuf, field_number: u32, value: u32) -> WriteResult<()> {
+    pub fn write_fixed32_field(
+        &mut self,
+        buf: &mut LoopBuf,
+        field_number: u32,
+        value: u32,
+    ) -> WriteResult<()> {
         let mut scratch = [0u8; 10];
         scratch[..4].copy_from_slice(&value.to_le_bytes());
         self.put_field(buf, field_number, WIRETYPE_I32, (scratch, 4), &[])
     }
 
-    pub fn write_double_field(&mut self, buf: &mut LoopBuf, field_number: u32, value: f64) -> WriteResult<()> {
+    pub fn write_double_field(
+        &mut self,
+        buf: &mut LoopBuf,
+        field_number: u32,
+        value: f64,
+    ) -> WriteResult<()> {
         self.write_fixed64_field(buf, field_number, value.to_bits())
     }
 
-    pub fn write_float_field(&mut self, buf: &mut LoopBuf, field_number: u32, value: f32) -> WriteResult<()> {
+    pub fn write_float_field(
+        &mut self,
+        buf: &mut LoopBuf,
+        field_number: u32,
+        value: f32,
+    ) -> WriteResult<()> {
         self.write_fixed32_field(buf, field_number, value.to_bits())
     }
 
     /// Writes a bytes field. The whole field must fit the ring.
-    pub fn write_bytes_field(&mut self, buf: &mut LoopBuf, field_number: u32, data: &[u8]) -> WriteResult<()> {
+    pub fn write_bytes_field(
+        &mut self,
+        buf: &mut LoopBuf,
+        field_number: u32,
+        data: &[u8],
+    ) -> WriteResult<()> {
         self.put_field(
             buf,
             field_number,
@@ -267,7 +326,12 @@ impl Writer {
         )
     }
 
-    pub fn write_string_field(&mut self, buf: &mut LoopBuf, field_number: u32, value: &str) -> WriteResult<()> {
+    pub fn write_string_field(
+        &mut self,
+        buf: &mut LoopBuf,
+        field_number: u32,
+        value: &str,
+    ) -> WriteResult<()> {
         self.write_bytes_field(buf, field_number, value.as_bytes())
     }
 
@@ -282,9 +346,16 @@ impl Writer {
     ///
     /// Inside [`Self::write_message_field`] the message has to fit the ring as a
     /// whole, so there a field written in pieces is bounded by the ring too.
-    pub fn write_start_bytes(&mut self, buf: &mut LoopBuf, field_number: u32, length: u64) -> WriteResult<()> {
+    pub fn write_start_bytes(
+        &mut self,
+        buf: &mut LoopBuf,
+        field_number: u32,
+        length: u64,
+    ) -> WriteResult<()> {
         if length > i32::MAX as u64 {
-            return Err(invalid_input("a length-delimited field is longer than a length prefix can express"));
+            return Err(invalid_input(
+                "a length-delimited field is longer than a length prefix can express",
+            ));
         }
         let (tag, tag_len) = tag_bytes(field_number, WIRETYPE_LEN);
         let (len, len_len) = varint_bytes(length);
@@ -303,7 +374,9 @@ impl Writer {
     pub fn write_bytes_content(&mut self, buf: &mut LoopBuf, data: &[u8]) -> WriteResult<usize> {
         self.sync(buf)?;
         let Some(owed) = self.bytes_owed else {
-            return Err(invalid_input("no bytes field is open: start one with write_start_bytes"));
+            return Err(invalid_input(
+                "no bytes field is open: start one with write_start_bytes",
+            ));
         };
         if data.len() as u64 > owed {
             return Err(invalid_input(format!(
@@ -330,7 +403,9 @@ impl Writer {
     pub fn write_end_bytes(&mut self, buf: &mut LoopBuf) -> WriteResult<()> {
         self.sync(buf)?;
         match self.bytes_owed {
-            None => Err(invalid_input("no bytes field is open: start one with write_start_bytes")),
+            None => Err(invalid_input(
+                "no bytes field is open: start one with write_start_bytes",
+            )),
             Some(0) => {
                 self.bytes_owed = None;
                 Ok(())
@@ -405,14 +480,20 @@ impl Writer {
             .len()
             .checked_sub(start)
             .expect("the content callback must only append to the ring, not consume from it");
-        let inner_prefixes: usize = self.prefixes.range(prefix_mark..).map(|p| p.len as usize).sum();
+        let inner_prefixes: usize = self
+            .prefixes
+            .range(prefix_mark..)
+            .map(|p| p.len as usize)
+            .sum();
         let content_len = in_ring + inner_prefixes;
         if content_len > i32::MAX as usize {
             buf.truncate(start);
             self.prefixes.truncate(prefix_mark);
             self.bytes_written = written_before;
             self.last_len = buf.len();
-            return Err(invalid_input("embedded message is longer than a length prefix can express"));
+            return Err(invalid_input(
+                "embedded message is longer than a length prefix can express",
+            ));
         }
 
         let (tag, tag_len) = tag_bytes(field_number, WIRETYPE_LEN);
@@ -432,7 +513,14 @@ impl Writer {
             bytes[tag_len..prefix_len].copy_from_slice(&length[..length_len]);
             // Before the prefixes of the messages inside this one, which were
             // added after `prefix_mark` and come later in the stream.
-            self.prefixes.insert(prefix_mark, Prefix { at, len: prefix_len as u8, bytes });
+            self.prefixes.insert(
+                prefix_mark,
+                Prefix {
+                    at,
+                    len: prefix_len as u8,
+                    bytes,
+                },
+            );
         }
         self.bytes_written += prefix_len as u64;
         self.last_len = buf.len();
@@ -445,7 +533,13 @@ impl Writer {
     }
 
     /// Appends `first` then `second` as one atomic write.
-    fn put(&mut self, buf: &mut LoopBuf, first: &[u8], second: &[u8], what: &str) -> WriteResult<()> {
+    fn put(
+        &mut self,
+        buf: &mut LoopBuf,
+        first: &[u8],
+        second: &[u8],
+        what: &str,
+    ) -> WriteResult<()> {
         self.begin(buf)?;
         ensure_room(buf, first.len() + second.len(), what)?;
         buf.extend_from_slice(first);
@@ -468,7 +562,11 @@ impl Writer {
         let (tag, tag_len) = tag_bytes(field_number, wire_type);
         let (value, value_len) = value;
         let need = tag_len + value_len + payload.len();
-        let what = if wire_type == WIRETYPE_LEN { "bytes field" } else { "field" };
+        let what = if wire_type == WIRETYPE_LEN {
+            "bytes field"
+        } else {
+            "field"
+        };
         self.begin(buf)?;
         ensure_room(buf, need, what)?;
         buf.extend_from_slice(&tag[..tag_len]);
@@ -539,4 +637,3 @@ fn varint_bytes(mut value: u64) -> ([u8; 10], usize) {
 fn tag_bytes(field_number: u32, wire_type: u8) -> ([u8; 10], usize) {
     varint_bytes(u64::from((field_number << 3) | u32::from(wire_type)))
 }
-

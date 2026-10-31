@@ -128,10 +128,7 @@ fn parse_multiple_varint_fields() {
     let mut input = ring(data.as_slice());
     parser.receive(&mut input).unwrap();
     parser.close(&mut input).unwrap();
-    assert_eq!(
-        handler.varints,
-        vec![(1, 42), (2, 100), (3, 256)]
-    );
+    assert_eq!(handler.varints, vec![(1, 42), (2, 100), (3, 256)]);
 }
 
 #[test]
@@ -179,7 +176,10 @@ fn parse_string_field() {
     parser.receive(&mut input).unwrap();
     parser.close(&mut input).unwrap();
     assert_eq!(handler.bytes.len(), 1);
-    assert_eq!(String::from_utf8(handler.bytes[0].1.clone()).unwrap(), "hello");
+    assert_eq!(
+        String::from_utf8(handler.bytes[0].1.clone()).unwrap(),
+        "hello"
+    );
 }
 
 #[test]
@@ -225,7 +225,9 @@ fn parse_embedded_message() {
 fn parse_nested_messages() {
     let data = write_message(|w, ring| {
         w.write_message_field(ring, 1, |level1, ring| {
-            level1.write_message_field(ring, 2, |level2, ring| level2.write_string_field(ring, 3, "deepest"))
+            level1.write_message_field(ring, 2, |level2, ring| {
+                level2.write_string_field(ring, 3, "deepest")
+            })
         })
     });
     let mut handler = MessageTrackingHandler {

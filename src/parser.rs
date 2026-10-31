@@ -57,15 +57,35 @@ pub struct Parser<H: Handler> {
 /// reported until the field is known to be complete.
 enum Scanned {
     Underflow,
-    Varint { field: u32, value: u64, len: usize },
-    Fixed64 { field: u32, value: u64, len: usize },
-    Fixed32 { field: u32, value: u32, len: usize },
+    Varint {
+        field: u32,
+        value: u64,
+        len: usize,
+    },
+    Fixed64 {
+        field: u32,
+        value: u64,
+        len: usize,
+    },
+    Fixed32 {
+        field: u32,
+        value: u32,
+        len: usize,
+    },
     /// The tag and length prefix of an embedded message (its content is
     /// parsed as ordinary fields).
-    Message { field: u32, header: usize, length: usize },
+    Message {
+        field: u32,
+        header: usize,
+        length: usize,
+    },
     /// The tag and length prefix of a bytes/string/packed field, whose payload
     /// is streamed to the handler.
-    Bytes { field: u32, header: usize, length: usize },
+    Bytes {
+        field: u32,
+        header: usize,
+        length: usize,
+    },
 }
 
 impl<H: Handler> Parser<H> {
@@ -173,7 +193,9 @@ impl<H: Handler> Parser<H> {
     /// yet complete (it can never fit).
     pub fn receive(&mut self, buf: &mut LoopBuf) -> ParseResult<()> {
         if self.closed {
-            return Err(ParseError::new("parser is closed: call reset() to parse another message"));
+            return Err(ParseError::new(
+                "parser is closed: call reset() to parse another message",
+            ));
         }
         self.underflow = false;
 
@@ -219,7 +241,11 @@ impl<H: Handler> Parser<H> {
                     self.handler.handle_fixed32(field, value)?;
                     len
                 }
-                Scanned::Message { field, header, length } => {
+                Scanned::Message {
+                    field,
+                    header,
+                    length,
+                } => {
                     // The tag and length prefix count against the parent
                     // levels BEFORE the new message is pushed, whose end is
                     // measured from the end of that prefix
@@ -229,7 +255,11 @@ impl<H: Handler> Parser<H> {
                     self.handler.start_message(field)?;
                     0 // already counted
                 }
-                Scanned::Bytes { field, header, length } => {
+                Scanned::Bytes {
+                    field,
+                    header,
+                    length,
+                } => {
                     buf.advance(header);
                     self.consumed += header as u64;
                     self.handler.start_bytes(field, length as u64)?;
@@ -457,9 +487,17 @@ impl<H: Handler> Parser<H> {
                     return Ok(Scanned::Underflow);
                 }
                 if self.handler.is_message(field) {
-                    Ok(Scanned::Message { field, header, length })
+                    Ok(Scanned::Message {
+                        field,
+                        header,
+                        length,
+                    })
                 } else {
-                    Ok(Scanned::Bytes { field, header, length })
+                    Ok(Scanned::Bytes {
+                        field,
+                        header,
+                        length,
+                    })
                 }
             }
 
