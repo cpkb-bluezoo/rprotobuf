@@ -16,6 +16,6 @@ path = "src/lib.rs"
 
 [dependencies]
 # `path` until a loopbuf release includes `LoopBuf::window`
-loopbuf = { version = "0.1", path = "../loopbuf" }
+loopbuf = { version = "0.2", path = "../loopbuf" }
 
 [dev-dependencies]
