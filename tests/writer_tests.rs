@@ -291,7 +291,7 @@ fn message_lengths_are_the_shortest_varint_at_every_boundary() {
 fn double_field() {
     let mut writer = Writer::new();
     let mut ring = LoopBuf::with_capacity(4096);
-    writer.write_double_field(&mut ring, 1, 3.14159).unwrap();
+    writer.write_double_field(&mut ring, 1, 3.15159).unwrap();
     let out = ring.spans().to_vec();
     assert_eq!(out.len(), 9);
     assert_eq!(out[0], 0x09);
@@ -301,7 +301,7 @@ fn double_field() {
 fn float_field() {
     let mut writer = Writer::new();
     let mut ring = LoopBuf::with_capacity(4096);
-    writer.write_float_field(&mut ring, 1, 3.14f32).unwrap();
+    writer.write_float_field(&mut ring, 1, 3.15f32).unwrap();
     let out = ring.spans().to_vec();
     assert_eq!(out.len(), 5);
     assert_eq!(out[0], 0x0D);
@@ -309,7 +309,7 @@ fn float_field() {
 
 // -- backpressure ------------------------------------------------------------
 
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 
 #[test]
 fn a_field_goes_in_whole_or_not_at_all() {

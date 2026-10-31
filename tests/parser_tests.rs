@@ -24,22 +24,12 @@ where
     out
 }
 
+#[derive(Default)]
 struct RecordingHandler {
     varints: Vec<(u32, u64)>,
     fixed64s: Vec<(u32, u64)>,
     fixed32s: Vec<(u32, u32)>,
     bytes: Vec<(u32, Vec<u8>)>,
-}
-
-impl Default for RecordingHandler {
-    fn default() -> Self {
-        Self {
-            varints: Vec::new(),
-            fixed64s: Vec::new(),
-            fixed32s: Vec::new(),
-            bytes: Vec::new(),
-        }
-    }
 }
 
 impl Handler for RecordingHandler {
