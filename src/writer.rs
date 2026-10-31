@@ -5,11 +5,6 @@ use loopbuf::LoopBuf;
 use crate::error::{WriteError, WriteResult};
 use crate::wire::{WIRETYPE_I32, WIRETYPE_I64, WIRETYPE_LEN, WIRETYPE_VARINT};
 
-/// Width of the length prefix reserved for an embedded message: enough for any
-/// length up to 2^35 - 1, and written as a padded varint (see
-/// [`Writer::write_message_field`]).
-const MESSAGE_LENGTH_WIDTH: usize = 5;
-
 /// Protobuf binary encoder that writes straight into a caller-owned [`LoopBuf`].
 ///
 /// The writer keeps no buffer of its own. Every `write_*` method takes the
@@ -157,11 +152,12 @@ impl Writer {
     /// the same call. This means the message must fit the ring as a whole, and
     /// `content` must only append to it, never consume from it.
     ///
-    /// The length is written as a padded varint of a fixed 5 bytes, because it
-    /// is not known until the content is written and the content cannot be
-    /// moved afterwards. Every conforming parser accepts a varint with padding
-    /// (this crate's does), but the bytes differ from the shortest encoding. An
-    /// empty message is written as a plain zero length.
+    /// The length is the shortest varint, as any other encoder would write it,
+    /// though it is not known until the content has been. One byte is reserved
+    /// for it, which is all a message under 128 bytes needs. A longer one has
+    /// its content moved on within the ring by the extra bytes the length
+    /// takes (a memmove of just that message, once, however deeply it is
+    /// nested), so the ring needs room for those too.
     pub fn write_message_field<F>(
         &mut self,
         buf: &mut LoopBuf,
@@ -172,13 +168,14 @@ impl Writer {
         F: FnOnce(&mut Writer, &mut LoopBuf) -> WriteResult<()>,
     {
         let (tag, tag_len) = tag_bytes(field_number, WIRETYPE_LEN);
-        let header_len = tag_len + MESSAGE_LENGTH_WIDTH;
+        // The tag and a one byte length, which is widened below if need be.
+        let header_len = tag_len + 1;
         ensure_room(buf, header_len, "embedded message")?;
 
         let start = buf.len();
         let written_before = self.bytes_written;
         buf.extend_from_slice(&tag[..tag_len]);
-        buf.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x00]); // patched below
+        buf.extend_from_slice(&[0x00]);
         self.bytes_written += header_len as u64;
 
         if let Err(e) = content(self, buf) {
@@ -187,23 +184,32 @@ impl Writer {
             return Err(e);
         }
 
+        let content_start = start + header_len;
         let content_len = buf
             .len()
-            .checked_sub(start + header_len)
+            .checked_sub(content_start)
             .expect("the content callback must only append to the ring, not consume from it");
-        if content_len == 0 {
-            // nothing to pad around: back to a plain one-byte zero length
-            buf.truncate(start + tag_len);
-            buf.extend_from_slice(&[0x00]);
-            self.bytes_written -= (MESSAGE_LENGTH_WIDTH - 1) as u64;
-            return Ok(());
-        }
-        if content_len as u64 >= 1 << (7 * MESSAGE_LENGTH_WIDTH) {
+        if content_len > i32::MAX as usize {
             buf.truncate(start);
             self.bytes_written = written_before;
-            return Err(invalid_input("embedded message is too long for a 5 byte length"));
+            return Err(invalid_input("embedded message is longer than a length prefix can express"));
         }
-        buf.overwrite(start + tag_len, &padded_varint(content_len as u64));
+        let (length, length_len) = varint_bytes(content_len as u64);
+        if length_len > 1 {
+            // Open a gap for the rest of the length. If the ring has no room
+            // for it the message as a whole does not fit (yet).
+            let extra = length_len - 1;
+            if buf.spare_len() < extra {
+                let total = tag_len + length_len + content_len;
+                buf.truncate(start);
+                self.bytes_written = written_before;
+                return Err(not_enough_room(buf, total, "embedded message"));
+            }
+            buf.extend_from_slice(&[0u8; 4][..extra]);
+            buf.copy_within(content_start..content_start + content_len, content_start + extra);
+            self.bytes_written += extra as u64;
+        }
+        buf.overwrite(start + tag_len, &length[..length_len]);
         Ok(())
     }
 
@@ -255,19 +261,26 @@ fn ensure_room(buf: &LoopBuf, need: usize, what: &str) -> WriteResult<()> {
     if need <= buf.spare_len() {
         return Ok(());
     }
+    Err(not_enough_room(buf, need, what))
+}
+
+/// The error for a write that needs `need` bytes and found too few: it can
+/// never succeed if the ring is too small for it, otherwise it can once the
+/// ring has been drained.
+fn not_enough_room(buf: &LoopBuf, need: usize, what: &str) -> WriteError {
     if need > buf.capacity() {
-        return Err(WriteError::new(io::Error::new(
+        return WriteError::new(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "{what} needs {need} bytes but the LoopBuf's whole capacity is {}",
                 buf.capacity()
             ),
-        )));
+        ));
     }
-    Err(WriteError::new(io::Error::new(
+    WriteError::new(io::Error::new(
         io::ErrorKind::WouldBlock,
         "LoopBuf has no room for the whole write: drain it and repeat the call",
-    )))
+    ))
 }
 
 fn zigzag64(value: i64) -> u64 {
@@ -297,14 +310,3 @@ fn tag_bytes(field_number: u32, wire_type: u8) -> ([u8; 10], usize) {
     varint_bytes(u64::from((field_number << 3) | u32::from(wire_type)))
 }
 
-/// `value` as a varint padded to [`MESSAGE_LENGTH_WIDTH`] bytes.
-fn padded_varint(value: u64) -> [u8; MESSAGE_LENGTH_WIDTH] {
-    let mut out = [0u8; MESSAGE_LENGTH_WIDTH];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = ((value >> (7 * i)) & 0x7F) as u8;
-        if i + 1 < MESSAGE_LENGTH_WIDTH {
-            *byte |= 0x80;
-        }
-    }
-    out
-}

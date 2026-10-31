@@ -34,8 +34,8 @@ pub const UNLIMITED_LENGTH_DELIMITED: usize = i32::MAX as usize;
 /// For data you do not trust, use [`Self::with_limits`]: a field declaring
 /// more than `max_length_delimited_size` is rejected as soon as its length
 /// prefix has been read, before any of its payload is buffered.
-pub struct Parser<'a, H: Handler + ?Sized> {
-    handler: &'a mut H,
+pub struct Parser<H: Handler> {
+    handler: H,
     max_message_depth: usize,
     max_length_delimited_size: usize,
     /// At each open message level, the stream offset at which that message
@@ -61,12 +61,18 @@ enum Scanned {
     Bytes { field: u32, header: usize, length: usize },
 }
 
-impl<'a, H: Handler + ?Sized> Parser<'a, H> {
-    /// Creates a parser with the default nesting limit and no limit on field size.
+impl<H: Handler> Parser<H> {
+    /// Creates a parser that owns `handler`, with the default nesting limit
+    /// and no limit on field size.
+    ///
+    /// To keep the handler yourself, lend it: `Parser::new(&mut handler)`
+    /// works because `&mut H` is a [`Handler`] whenever `H` is. Use
+    /// [`Self::handler`], [`Self::handler_mut`] and [`Self::into_handler`] to
+    /// get at one the parser owns.
     ///
     /// See *Untrusted input* in the type documentation before using this on
     /// data you do not trust.
-    pub fn new(handler: &'a mut H) -> Self {
+    pub fn new(handler: H) -> Self {
         Self::with_limits(handler, DEFAULT_MAX_MESSAGE_DEPTH, UNLIMITED_LENGTH_DELIMITED)
     }
 
@@ -80,7 +86,7 @@ impl<'a, H: Handler + ?Sized> Parser<'a, H> {
     ///
     /// If `max_message_depth` is less than 1.
     pub fn with_limits(
-        handler: &'a mut H,
+        handler: H,
         max_message_depth: usize,
         max_length_delimited_size: usize,
     ) -> Self {
@@ -93,6 +99,21 @@ impl<'a, H: Handler + ?Sized> Parser<'a, H> {
             consumed: 0,
             underflow: false,
         }
+    }
+
+    /// The handler the parser is driving.
+    pub fn handler(&self) -> &H {
+        &self.handler
+    }
+
+    /// Mutable access to the handler between calls to [`Self::receive`].
+    pub fn handler_mut(&mut self) -> &mut H {
+        &mut self.handler
+    }
+
+    /// Takes the handler back, dropping the parser.
+    pub fn into_handler(self) -> H {
+        self.handler
     }
 
     /// True if the last [`Self::receive`] ended with an incomplete field left

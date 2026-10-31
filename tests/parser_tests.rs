@@ -311,3 +311,54 @@ fn reset_parser() {
     // handler between phases — not possible here while parser borrows handler).
     assert_eq!(handler.varints, vec![(1, 42), (1, 99)]);
 }
+
+// ===== Handler ownership =====
+
+#[test]
+fn a_parser_owns_the_handler_it_is_given_and_hands_it_back() {
+    let data = write_message(|w, ring| {
+        w.write_varint_field(ring, 1, 7)?;
+        w.write_varint_field(ring, 2, 8)
+    });
+    let mut parser = Parser::new(RecordingHandler::default());
+    let mut input = ring(data.as_slice());
+    parser.receive(&mut input).unwrap();
+    parser.close().unwrap();
+    // Readable while the parser is still in use, between calls...
+    assert_eq!(parser.handler().varints, vec![(1, 7), (2, 8)]);
+    parser.handler_mut().varints.clear();
+    // ...and taken back for good at the end.
+    let handler = parser.into_handler();
+    assert!(handler.varints.is_empty());
+}
+
+#[test]
+fn a_handler_can_still_be_lent_to_the_parser() {
+    let data = write_message(|w, ring| w.write_varint_field(ring, 3, 9));
+    let mut handler = RecordingHandler::default();
+    {
+        let mut parser = Parser::new(&mut handler);
+        let mut input = ring(data.as_slice());
+        parser.receive(&mut input).unwrap();
+        parser.close().unwrap();
+    }
+    assert_eq!(handler.varints, vec![(3, 9)]);
+}
+
+#[test]
+fn a_boxed_dyn_handler_drives_the_parser() {
+    let data = write_message(|w, ring| w.write_varint_field(ring, 1, 5));
+    let mut parser = Parser::new(Box::new(RecordingHandler::default()) as Box<dyn Handler>);
+    let mut input = ring(data.as_slice());
+    parser.receive(&mut input).unwrap();
+    parser.close().unwrap();
+
+    // A handler behind a reference to the trait object works the same.
+    let mut recording = RecordingHandler::default();
+    let dynamic: &mut dyn Handler = &mut recording;
+    let mut parser = Parser::new(dynamic);
+    let mut input = ring(data.as_slice());
+    parser.receive(&mut input).unwrap();
+    drop(parser);
+    assert_eq!(recording.varints, vec![(1, 5)]);
+}

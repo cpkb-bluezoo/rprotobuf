@@ -35,11 +35,16 @@ impl Handler for JobHandler {
 let mut buf = LoopBuf::with_capacity(4096);
 Writer::new().write_string_field(&mut buf, 1, "job-abc").unwrap();
 
-let mut handler = JobHandler { job_id: None };
-let mut parser = Parser::new(&mut handler);
+let mut parser = Parser::new(JobHandler { job_id: None });
 parser.receive(&mut buf).unwrap();
 parser.close().unwrap();
+let handler = parser.into_handler();
 ```
+
+The parser owns its handler: `handler()` and `handler_mut()` reach it between
+calls and `into_handler()` takes it back. To keep it yourself instead, lend
+it: `Parser::new(&mut handler)` works because `&mut H` (and `Box<H>`, so
+`Box<dyn Handler>` too) is a `Handler` whenever `H` is.
 
 ### Streaming (caller-owned buffer contract)
 
@@ -112,10 +117,11 @@ since the field began is taken back, so the message as a whole is atomic and the
 call can be repeated. This means the message must fit the ring, and the closure
 must only append to it, never consume from it.
 
-Because the length is not known until the content is written, it is a varint
-padded to a fixed 5 bytes (an empty message is a plain zero). That is valid on
-the wire and accepted by every conforming parser, but it is not the shortest
-encoding, so the bytes differ from other encoders' output for the same message.
+The length is the shortest varint, as any other encoder writes it. It is not
+known until the content is, so one byte is reserved, which is all a message under
+128 bytes needs; a longer message has its content moved on within the ring by the
+extra bytes the length takes (one `LoopBuf::copy_within` of that message), so the
+ring needs room for those too.
 
 ## Relationship to other bluezoo libraries
 

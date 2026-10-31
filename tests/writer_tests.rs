@@ -183,13 +183,12 @@ fn message_field() {
             inner.write_string_field(ring, 1, "test")
         })
         .unwrap();
-    // The length is written first but known last, so it is a varint padded to
-    // 5 bytes (0x86 0x80 0x80 0x80 0x00 = 6): valid, though not the shortest.
+    // The length is the shortest varint, as any encoder would write it.
     assert_eq!(
         ring.spans().to_vec(),
-        vec![0x0A, 0x86, 0x80, 0x80, 0x80, 0x00, 0x0A, 0x04, b't', b'e', b's', b't']
+        vec![0x0A, 0x06, 0x0A, 0x04, b't', b'e', b's', b't']
     );
-    assert_eq!(writer.bytes_written(), 12);
+    assert_eq!(writer.bytes_written(), 8);
 }
 
 #[test]
@@ -215,23 +214,109 @@ fn nested_messages_fill_in_every_length() {
             })
         })
         .unwrap();
-    // outer: tag, padded length; 2 (varint field) + 1 + 5 (inner header) + 203
+    // inner: tag 0A, a 2 byte length (200 + 3 = 203 = CB 01), 200 bytes;
+    // outer: 08 07 (2), the inner field (1 + 2 + 203 = 206), so 208 = D0 01
     let bytes = ring.spans().to_vec();
-    assert_eq!(bytes[0], 0x0A);
-    let outer = padded(&bytes[1..6]);
-    assert_eq!(outer as usize, bytes.len() - 6);
-    let inner_at = 6 + 2; // after the varint field 08 07
-    assert_eq!(bytes[inner_at], 0x12);
-    let inner = padded(&bytes[inner_at + 1..inner_at + 6]);
-    assert_eq!(inner as usize, 203, "tag 0A + 2 byte length + 200 bytes");
+    assert_eq!(&bytes[..3], &[0x0A, 0xD0, 0x01]);
+    assert_eq!(&bytes[3..8], &[0x08, 0x07, 0x12, 0xCB, 0x01]);
+    assert_eq!(bytes.len(), 3 + 208);
+    assert_eq!(writer.bytes_written(), bytes.len() as u64);
 }
 
-fn padded(bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| u64::from(b & 0x7F) << (7 * i))
-        .sum()
+/// The same message as an encoder that knows its size up front would write.
+fn reference_message(field: u32, content: &[u8]) -> Vec<u8> {
+    let mut writer = Writer::new();
+    let mut ring = LoopBuf::with_capacity(content.len() + 32);
+    writer.write_encoded_message_field(&mut ring, field, content).unwrap();
+    if content.is_empty() {
+        // write_encoded_message_field skips an empty message; a message
+        // field of nothing is a plain zero length.
+        return vec![(field << 3 | 2) as u8, 0];
+    }
+    ring.spans().to_vec()
+}
+
+#[test]
+fn message_lengths_are_the_shortest_varint_at_every_boundary() {
+    // Content sizes either side of where the length gains a byte.
+    for target in [0usize, 1, 2, 126, 127, 128, 129, 130, 16382, 16383, 16384, 16385, 40000] {
+        let payload = target.saturating_sub(3);
+        let mut content_ring = LoopBuf::with_capacity(target + 16);
+        let mut w = Writer::new();
+        if target >= 3 {
+            w.write_bytes_field(&mut content_ring, 1, &vec![0xAB; payload]).unwrap();
+        } else if target > 0 {
+            for _ in 0..target {
+                content_ring.extend_from_slice(&[0x00]);
+            }
+        }
+        let content = content_ring.spans().to_vec();
+
+        let mut writer = Writer::new();
+        let mut ring = LoopBuf::with_capacity(content.len() + 16);
+        writer
+            .write_message_field(&mut ring, 5, |inner, ring| {
+                if target >= 3 {
+                    inner.write_bytes_field(ring, 1, &vec![0xAB; payload])
+                } else {
+                    ring.extend_from_slice(&content);
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert_eq!(ring.spans().to_vec(), reference_message(5, &content), "content of {} bytes", content.len());
+        if target == 0 || target >= 3 {
+            // (the smallest are filled in by hand, past the writer's count)
+            assert_eq!(writer.bytes_written(), ring.len() as u64);
+        }
+    }
+}
+
+#[test]
+fn a_message_that_gains_a_length_byte_is_right_wherever_the_ring_wraps() {
+    // 200 bytes of content needs a 2 byte length, so the content is moved on
+    // by one within the ring: at every read position, that move may straddle
+    // the end of the backing array.
+    let content_writer = |inner: &mut Writer, ring: &mut LoopBuf| {
+        inner.write_bytes_field(ring, 1, &(0..197u32).map(|i| i as u8).collect::<Vec<u8>>())
+    };
+    let mut expected_ring = LoopBuf::with_capacity(1024);
+    Writer::new().write_message_field(&mut expected_ring, 9, content_writer).unwrap();
+    let expected = expected_ring.spans().to_vec();
+    for capacity in [expected.len(), expected.len() + 1, 256, 300] {
+        for offset in 0..capacity {
+            let mut ring = LoopBuf::with_capacity(capacity);
+            ring.extend_from_slice(&vec![0; offset]);
+            ring.advance(offset);
+            Writer::new().write_message_field(&mut ring, 9, content_writer).unwrap();
+            assert_eq!(ring.spans().to_vec(), expected, "capacity {capacity} offset {offset}");
+        }
+    }
+}
+
+#[test]
+fn widening_the_length_without_room_waits_or_fails_by_whether_it_could_ever_fit() {
+    // Content of 128 bytes: 1 tag + 1 reserved length + 128 fits a ring of
+    // 130, but the finished message is 1 + 2 + 128 = 131.
+    let write = |ring: &mut LoopBuf| {
+        Writer::new().write_message_field(ring, 1, |inner, ring| {
+            inner.write_bytes_field(ring, 1, &[1u8; 126]) // 1 + 1 + 126 = 128
+        })
+    };
+    let mut ring = LoopBuf::with_capacity(130);
+    let err = write(&mut ring).unwrap_err();
+    assert!(!err.is_would_block(), "can never fit");
+    assert!(ring.is_empty(), "and nothing was left behind");
+
+    // In a bigger ring that is partly full it only has to wait.
+    let mut ring = LoopBuf::with_capacity(200);
+    ring.extend_from_slice(&[0xEE; 70]); // 130 spare: the content fits, the finished message does not
+    let err = write(&mut ring).unwrap_err();
+    assert!(err.is_would_block());
+    assert_eq!(ring.len(), 70);
+    ring.advance(70);
+    write(&mut ring).unwrap();
+    assert_eq!(ring.len(), 131);
 }
 
 #[test]

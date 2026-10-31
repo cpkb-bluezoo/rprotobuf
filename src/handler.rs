@@ -42,6 +42,69 @@ pub trait Handler {
     fn end_message(&mut self) {}
 }
 
+/// Lends a handler to a parser: `Parser::new(&mut handler)` leaves the handler
+/// with the caller.
+impl<H: Handler + ?Sized> Handler for &mut H {
+    fn handle_varint(&mut self, field_number: u32, value: u64) {
+        (**self).handle_varint(field_number, value)
+    }
+
+    fn handle_fixed64(&mut self, field_number: u32, value: u64) {
+        (**self).handle_fixed64(field_number, value)
+    }
+
+    fn handle_fixed32(&mut self, field_number: u32, value: u32) {
+        (**self).handle_fixed32(field_number, value)
+    }
+
+    fn handle_bytes(&mut self, field_number: u32, data: &mut LoopBuf) {
+        (**self).handle_bytes(field_number, data)
+    }
+
+    fn is_message(&self, field_number: u32) -> bool {
+        (**self).is_message(field_number)
+    }
+
+    fn start_message(&mut self, field_number: u32) {
+        (**self).start_message(field_number)
+    }
+
+    fn end_message(&mut self) {
+        (**self).end_message()
+    }
+}
+
+/// A boxed handler, `Box<dyn Handler>` included.
+impl<H: Handler + ?Sized> Handler for Box<H> {
+    fn handle_varint(&mut self, field_number: u32, value: u64) {
+        (**self).handle_varint(field_number, value)
+    }
+
+    fn handle_fixed64(&mut self, field_number: u32, value: u64) {
+        (**self).handle_fixed64(field_number, value)
+    }
+
+    fn handle_fixed32(&mut self, field_number: u32, value: u32) {
+        (**self).handle_fixed32(field_number, value)
+    }
+
+    fn handle_bytes(&mut self, field_number: u32, data: &mut LoopBuf) {
+        (**self).handle_bytes(field_number, data)
+    }
+
+    fn is_message(&self, field_number: u32) -> bool {
+        (**self).is_message(field_number)
+    }
+
+    fn start_message(&mut self, field_number: u32) {
+        (**self).start_message(field_number)
+    }
+
+    fn end_message(&mut self) {
+        (**self).end_message()
+    }
+}
+
 /// No-op handler; override selected methods or use `decode_helpers`.
 pub struct DefaultHandler;
 
