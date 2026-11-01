@@ -15,7 +15,6 @@ name = "rprotobuf"
 path = "src/lib.rs"
 
 [dependencies]
-# `path` until a loopbuf release includes `LoopBuf::window`
-loopbuf = { version = "0.2", path = "../loopbuf" }
+loopbuf = "0.2"
 
 [dev-dependencies]
